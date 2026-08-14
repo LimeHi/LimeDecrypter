@@ -4,10 +4,15 @@ import base64
 import os
 import re
 
-TOKEN = ''            # токен бота от @BotFather
-CHANNEL_USERNAME = ''  # канал, подписка на который обязательна, формат: @название
-FOOTER_TAG = ''        # подпись, которая будет добавляться под сообщениями
-FILE_PREFIX = ''       # префикс имени файла с ключами (например: @LimeVPNFREE_keys)
+TOKEN = os.getenv('TOKEN')                       # токен бота от @BotFather
+CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME')  # канал, подписка обязательна, формат: @название
+FOOTER_TAG = os.getenv('FOOTER_TAG', '')          # подпись под сообщениями
+FILE_PREFIX = os.getenv('FILE_PREFIX', 'keys')    # префикс имени файла с ключами
+
+if not TOKEN:
+    raise ValueError("Переменная окружения TOKEN не задана")
+if not CHANNEL_USERNAME:
+    raise ValueError("Переменная окружения CHANNEL_USERNAME не задана")
 
 bot = telebot.TeleBot(TOKEN)
 
