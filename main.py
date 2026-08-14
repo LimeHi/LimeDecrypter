@@ -11,7 +11,7 @@ import time
 import json
 import urllib.parse
 
-from flask import Flask, abort, Response, request  # добавили request для чтения параметров
+from flask import Flask, abort, Response, request
 
 # ==================== КОНФИГУРАЦИЯ (переменные окружения) ====================
 
@@ -104,7 +104,7 @@ def get_db():
             type TEXT NOT NULL,
             content TEXT NOT NULL,
             owner_id INTEGER,
-            hwid TEXT,                     -- <-- НОВОЕ ПОЛЕ
+            hwid TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -124,10 +124,6 @@ def generate_code(length: int = 7) -> str:
             conn.close()
 
 def save_link(link_type: str, content: str, owner_id: int, hwid: str = None) -> str:
-    """
-    Сохраняет ссылку с опциональным HWID.
-    Если hwid не указан, то защита не применяется.
-    """
     code = generate_code()
     with db_lock:
         conn = get_db()
@@ -146,7 +142,7 @@ def get_link(code: str):
         conn = get_db()
         try:
             row = conn.execute('SELECT type, content, hwid FROM links WHERE code = ?', (code,)).fetchone()
-            return row  # (type, content, hwid)
+            return row
         finally:
             conn.close()
 
@@ -213,14 +209,11 @@ def resolve_link(code):
 
     link_type, content, owner_id, hwid = row
 
-    # --- ПРОВЕРКА HWID (если задан) ---
     if hwid:
-        # Поддерживаем оба параметра: ?hwid=... и ?payload=...
         request_hwid = request.args.get('hwid') or request.args.get('payload')
         if not request_hwid or request_hwid != hwid:
-            abort(403)  # Доступ запрещён
+            abort(403)
 
-    # --- Дальше как обычно ---
     if link_type == 'url':
         try:
             resp = requests.get(content, timeout=15)
@@ -589,7 +582,6 @@ def cmd_hwid_auto(message):
         return
 
     content = parts[1].strip()
-    # Генерируем HWID как tg_<id>_<рандом>
     hwid = f"tg_{message.from_user.id}_{random.randint(1000, 9999)}"
 
     code = save_link('hwid', content, message.from_user.id, hwid)
@@ -602,7 +594,7 @@ def cmd_hwid_auto(message):
         f"⚠️ Сохраните HWID — он понадобится для доступа."
     ), parse_mode="Markdown")
 
-# ==================== ОБРАБОТЧИКИ КОМАНД (уже существующие) ====================
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -612,15 +604,15 @@ def send_welcome(message):
 
     welcome_text = (
         "Здравствуйте.\n\n"
-        "• Отправьте ссылку **happ://crypt...**, чтобы расшифровать её в URL.\n"
-        "• Отправьте обычную ссылку (**http://...** или **https://...**), чтобы скачать подписку и достать из неё VPN-ключи.\n"
+        "• Отправьте ссылку happ://crypt..., чтобы расшифровать её в URL.\n"
+        "• Отправьте обычную ссылку (http://... или https://...), чтобы скачать подписку и достать из неё VPN-ключи.\n"
         "• Команда /addkeys — чтобы сохранить свои ключи и получить короткую ссылку на них.\n"
         "• Команда /shorten — чтобы сократить любую ссылку (оригинал будет скрыт).\n"
         "• Команда /hwid — создать ссылку с защитой по HWID (указываете сами).\n"
         "• Команда /hwid_auto — создать ссылку с автоматической генерацией HWID.\n"
         "• Команда /profile — посмотреть, изменить или удалить свои сохранённые ссылки."
     )
-    safe_reply_to(message, with_footer(welcome_text), parse_mode="Markdown")
+    safe_reply_to(message, with_footer(welcome_text))  # <-- убрали parse_mode
 
 @bot.message_handler(commands=['addkeys'])
 def cmd_addkeys(message):
@@ -660,7 +652,7 @@ def process_addkeys(message):
             return
 
         content = "\n".join(keys)
-        code = save_link('keys', content, message.from_user.id, None)  # без HWID
+        code = save_link('keys', content, message.from_user.id, None)
         short_url = build_short_url(code)
 
         safe_reply_to(message, with_footer(
@@ -706,7 +698,7 @@ def process_shorten(message):
             ))
             return
 
-        code = save_link('url', text, message.from_user.id, None)  # без HWID
+        code = save_link('url', text, message.from_user.id, None)
         short_url = build_short_url(code)
 
         safe_reply_to(message, with_footer(f"Готово! Короткая ссылка:\n{short_url}"))
@@ -717,15 +709,12 @@ def process_shorten(message):
         except Exception:
             pass
 
-# ==================== ПРОФИЛЬ (без изменений, но теперь видно только обычные ссылки, HWID-ссылки тоже отображаются) ====================
+# ==================== ПРОФИЛЬ ====================
 
 def build_profile_menu(rows: list) -> telebot.types.InlineKeyboardMarkup:
     markup = telebot.types.InlineKeyboardMarkup()
     for code, link_type, content, created_at in rows:
-        icon = "🔗" if link_type == 'url' else "🔑"
-        # для hwid-ссылок тоже используем ключ
-        if link_type == 'hwid':
-            icon = "🛡️"
+        icon = "🔗" if link_type == 'url' else ("🛡️" if link_type == 'hwid' else "🔑")
         markup.add(
             telebot.types.InlineKeyboardButton(
                 text=f"{icon}  /{code}",
@@ -889,12 +878,10 @@ def process_edit_link(message, code, link_type, owner_id):
                 return
             new_content = new_text
         else:
-            # Для ключей и HWID-ссылок — пробуем извлечь ключи, если есть
             keys = extract_keys(new_text)
             if keys:
                 new_content = "\n".join(keys)
             else:
-                # Если ключей нет, сохраняем как есть (может быть обычный текст)
                 new_content = new_text
 
         success = update_link_content(code, owner_id, new_content)
@@ -974,7 +961,7 @@ def handle_text_inner(message):
         safe_reply_to(message, with_footer(
             "Неверный формат. Отправьте либо ссылку **happ://crypt...**, либо обычную ссылку на подписку (**http://...**), "
             "либо используйте /addkeys, /shorten, /hwid или /hwid_auto."
-        ), parse_mode="Markdown")
+        ), parse_mode="Markdown")  # здесь тоже оставлен Markdown, но в этом месте текст безопасен
 
 # ==================== ЗАПУСК ====================
 
