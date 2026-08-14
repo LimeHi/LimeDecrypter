@@ -243,9 +243,9 @@ def send_welcome(message):
     welcome_text = (
         "Здравствуйте.\n\n"
         "• Отправьте ссылку **happ://crypt...**, чтобы расшифровать её в URL.\n"
-        "• Отправьте обычную ссылку (**http://...** или **https://...**), чтобы скачать подписку, "
-        "достать из неё VPN-ключи и получить короткую ссылку, скрывающую оригинальный адрес.\n"
-        "• Команда /addkeys — чтобы сохранить свои ключи и получить короткую ссылку на них."
+        "• Отправьте обычную ссылку (**http://...** или **https://...**), чтобы скачать подписку и достать из неё VPN-ключи.\n"
+        "• Команда /addkeys — чтобы сохранить свои ключи и получить короткую ссылку на них.\n"
+        "• Команда /shorten — чтобы сократить любую ссылку (оригинал будет скрыт)."
     )
     bot.reply_to(message, with_footer(welcome_text), parse_mode="Markdown")
 
@@ -294,6 +294,44 @@ def process_addkeys(message):
         except Exception:
             pass
 
+@bot.message_handler(commands=['shorten'])
+def cmd_shorten(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
+
+    msg = bot.reply_to(
+        message,
+        with_footer("Пришлите ссылку (http:// или https://), которую нужно сократить.")
+    )
+    bot.register_next_step_handler(msg, process_shorten)
+
+def process_shorten(message):
+    try:
+        if not is_subscribed(message.from_user.id):
+            send_subscribe_prompt(message.chat.id)
+            return
+
+        text = (message.text or "").strip()
+
+        if not (text.startswith("http://") or text.startswith("https://")):
+            bot.reply_to(message, with_footer(
+                "Это не похоже на ссылку. Отправьте адрес, начинающийся с http:// или https://. "
+                "Попробуйте ещё раз через /shorten."
+            ))
+            return
+
+        code = save_link('url', text, message.from_user.id)
+        short_url = build_short_url(code)
+
+        bot.reply_to(message, with_footer(f"Готово! Короткая ссылка:\n{short_url}"))
+    except Exception as e:
+        print(f"[ОШИБКА в process_shorten]: {e}")
+        try:
+            bot.reply_to(message, with_footer(f"Произошла ошибка при сокращении: {e}"))
+        except Exception:
+            pass
+
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     try:
@@ -332,10 +370,6 @@ def handle_text_inner(message):
             bot.reply_to(message, with_footer(configs_text))
             return
 
-        # Создаём короткую ссылку-редирект на оригинальный URL (сам оригинал нигде не светим)
-        code = save_link('url', text, message.from_user.id)
-        short_url = build_short_url(code)
-
         keys = extract_keys(configs_text)
 
         if keys:
@@ -359,12 +393,10 @@ def handle_text_inner(message):
                 if os.path.exists(file_name):
                     os.remove(file_name)
 
-        bot.send_message(message.chat.id, with_footer(f"Короткая ссылка на подписку (оригинал скрыт):\n{short_url}"))
-
     else:
         bot.reply_to(message, with_footer(
             "Неверный формат. Отправьте либо ссылку **happ://crypt...**, либо обычную ссылку на подписку (**http://...**), "
-            "либо используйте /addkeys."
+            "либо используйте /addkeys или /shorten."
         ), parse_mode="Markdown")
 
 # ==================== ЗАПУСК ====================
