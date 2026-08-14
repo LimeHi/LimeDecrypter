@@ -287,17 +287,75 @@ def decrypt_happ_link(encrypted_link: str) -> str:
         print(f"Ошибка API дешифровки: {e}")
         return ""
 
-def fetch_and_decode_configs(url: str) -> str:
+def try_decode_base64(text: str) -> str:
+    """Пробует декодировать Base64, иначе возвращает как есть."""
     try:
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        content = response.text.strip()
-        try:
-            padded_content = content + '=' * (-len(content) % 4)
-            decoded_bytes = base64.b64decode(padded_content)
-            return decoded_bytes.decode('utf-8')
-        except Exception:
-            return content
+        padded = text + '=' * (-len(text) % 4)
+        return base64.b64decode(padded).decode('utf-8')
+    except Exception:
+        return text
+
+def is_html(content_type: str, body: str) -> bool:
+    return "text/html" in content_type or body.lstrip().startswith(("<html", "<!DOCTYPE", "<!doctype"))
+
+def fetch_and_decode_configs(url: str) -> str:
+    """
+    Скачивает подписку. Если ответ — HTML (JS-рендер, Marzban и т.п.),
+    пробует несколько обходных вариантов с заголовками VPN-клиента.
+    """
+    VPN_HEADERS = {
+        "User-Agent": "clash.meta",
+        "Accept": "text/plain, application/json, */*",
+    }
+
+    def fetch(u, headers=None):
+        r = requests.get(u, headers=headers or {}, timeout=15)
+        r.raise_for_status()
+        return r
+
+    try:
+        # Шаг 1: обычный запрос
+        resp = fetch(url)
+        ct = resp.headers.get("Content-Type", "")
+        body = resp.text.strip()
+
+        if not is_html(ct, body):
+            return try_decode_base64(body)
+
+        # Шаг 2: тот же URL, но с заголовками VPN-клиента
+        resp2 = fetch(url, VPN_HEADERS)
+        ct2 = resp2.headers.get("Content-Type", "")
+        body2 = resp2.text.strip()
+
+        if not is_html(ct2, body2):
+            return try_decode_base64(body2)
+
+        # Шаг 3: /sub/<token> — паттерн Marzban и похожих панелей
+        base = url.rstrip("/")
+        # Извлекаем токен из последнего сегмента пути
+        token = base.split("/")[-1]
+        origin = "/".join(base.split("/")[:-1])  # https://domain.com
+
+        sub_candidates = [
+            f"{origin}/sub/{token}",
+            f"{base}/sub",
+            f"{base}?format=clash",
+            f"{base}?app=happ",
+        ]
+
+        for alt_url in sub_candidates:
+            try:
+                r = fetch(alt_url, VPN_HEADERS)
+                ct_alt = r.headers.get("Content-Type", "")
+                body_alt = r.text.strip()
+                if not is_html(ct_alt, body_alt) and body_alt:
+                    return try_decode_base64(body_alt)
+            except Exception:
+                continue
+
+        # Ничего не сработало — вернём тело как есть, бот попробует найти ключи
+        return body2
+
     except requests.exceptions.RequestException as e:
         return f"Сетевая ошибка при скачивании подписки: {e}"
     except Exception as e:
