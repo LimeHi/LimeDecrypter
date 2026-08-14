@@ -11,7 +11,7 @@ import time
 import json
 import urllib.parse
 
-from flask import Flask, abort, Response
+from flask import Flask, abort, Response, request  # добавили request для чтения параметров
 
 # ==================== КОНФИГУРАЦИЯ (переменные окружения) ====================
 
@@ -104,6 +104,7 @@ def get_db():
             type TEXT NOT NULL,
             content TEXT NOT NULL,
             owner_id INTEGER,
+            hwid TEXT,                     -- <-- НОВОЕ ПОЛЕ
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -122,14 +123,18 @@ def generate_code(length: int = 7) -> str:
         finally:
             conn.close()
 
-def save_link(link_type: str, content: str, owner_id: int) -> str:
+def save_link(link_type: str, content: str, owner_id: int, hwid: str = None) -> str:
+    """
+    Сохраняет ссылку с опциональным HWID.
+    Если hwid не указан, то защита не применяется.
+    """
     code = generate_code()
     with db_lock:
         conn = get_db()
         try:
             conn.execute(
-                'INSERT INTO links (code, type, content, owner_id) VALUES (?, ?, ?, ?)',
-                (code, link_type, content, owner_id)
+                'INSERT INTO links (code, type, content, owner_id, hwid) VALUES (?, ?, ?, ?, ?)',
+                (code, link_type, content, owner_id, hwid)
             )
             conn.commit()
         finally:
@@ -140,8 +145,8 @@ def get_link(code: str):
     with db_lock:
         conn = get_db()
         try:
-            row = conn.execute('SELECT type, content FROM links WHERE code = ?', (code,)).fetchone()
-            return row
+            row = conn.execute('SELECT type, content, hwid FROM links WHERE code = ?', (code,)).fetchone()
+            return row  # (type, content, hwid)
         finally:
             conn.close()
 
@@ -149,7 +154,7 @@ def get_link_full(code: str):
     with db_lock:
         conn = get_db()
         try:
-            row = conn.execute('SELECT type, content, owner_id FROM links WHERE code = ?', (code,)).fetchone()
+            row = conn.execute('SELECT type, content, owner_id, hwid FROM links WHERE code = ?', (code,)).fetchone()
             return row
         finally:
             conn.close()
@@ -202,12 +207,20 @@ def health_check():
 
 @app.route('/<code>')
 def resolve_link(code):
-    row = get_link(code)
+    row = get_link_full(code)
     if not row:
         abort(404)
 
-    link_type, content = row
+    link_type, content, owner_id, hwid = row
 
+    # --- ПРОВЕРКА HWID (если задан) ---
+    if hwid:
+        # Поддерживаем оба параметра: ?hwid=... и ?payload=...
+        request_hwid = request.args.get('hwid') or request.args.get('payload')
+        if not request_hwid or request_hwid != hwid:
+            abort(403)  # Доступ запрещён
+
+    # --- Дальше как обычно ---
     if link_type == 'url':
         try:
             resp = requests.get(content, timeout=15)
@@ -290,7 +303,6 @@ def decrypt_happ_link(encrypted_link: str) -> str:
         return ""
 
 def try_decode_base64(text: str) -> str:
-    """Пробует декодировать Base64, иначе возвращает как есть."""
     try:
         padded = text + '=' * (-len(text) % 4)
         return base64.b64decode(padded).decode('utf-8')
@@ -301,13 +313,6 @@ def is_html(content_type: str, body: str) -> bool:
     return "text/html" in content_type or body.lstrip().startswith(("<html", "<!DOCTYPE", "<!doctype"))
 
 # ==================== КОНВЕРТЕР XRAY/V2RAY JSON -> URI-ССЫЛКИ ====================
-#
-# Некоторые подписки (в т.ч. панели, отдающие полный конфиг для приложения
-# Xray/V2Box/NekoBox) возвращают не список vless://.../vmess://... строк,
-# а один JSON-массив полных конфигов вида:
-#   [{ "inbounds": [...], "outbounds": [{ "protocol": "vless", ... }], "remarks": "..." }, ...]
-# Регулярка KEY_PATTERN такой формат не ловит, поэтому нужен отдельный разбор.
-# Служебные outbound'ы (freedom / blackhole / dns) пропускаются — это не сервера.
 
 def _vless_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
     settings = outbound.get('settings', {}) or {}
@@ -416,7 +421,6 @@ def _trojan_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
     name = urllib.parse.quote(remarks or '')
     return f"trojan://{password}@{address}:{port}?{query}#{name}"
 
-# Протоколы-заглушки, которые не являются реальными VPN-серверами
 _NON_PROXY_PROTOCOLS = {'freedom', 'blackhole', 'dns'}
 
 _OUTBOUND_CONVERTERS = {
@@ -427,12 +431,6 @@ _OUTBOUND_CONVERTERS = {
 }
 
 def convert_xray_json_to_links(text: str) -> list:
-    """
-    Пытается распарсить текст как JSON-конфиг(и) Xray/V2Ray (один объект
-    или список объектов с полем outbounds) и собрать из них список
-    обычных URI-ссылок (vless://, hysteria2://, trojan://...).
-    Возвращает пустой список, если это не похоже на такой JSON.
-    """
     try:
         data = json.loads(text)
     except Exception:
@@ -469,10 +467,6 @@ def convert_xray_json_to_links(text: str) -> list:
     return links
 
 def fetch_and_decode_configs(url: str) -> str:
-    """
-    Скачивает подписку. Если ответ — HTML (JS-рендер, Marzban и т.п.),
-    пробует несколько обходных вариантов с заголовками VPN-клиента.
-    """
     VPN_HEADERS = {
         "User-Agent": "clash.meta",
         "Accept": "text/plain, application/json, */*",
@@ -484,7 +478,6 @@ def fetch_and_decode_configs(url: str) -> str:
         return r
 
     try:
-        # Шаг 1: обычный запрос
         resp = fetch(url)
         ct = resp.headers.get("Content-Type", "")
         body = resp.text.strip()
@@ -492,7 +485,6 @@ def fetch_and_decode_configs(url: str) -> str:
         if not is_html(ct, body):
             return try_decode_base64(body)
 
-        # Шаг 2: тот же URL, но с заголовками VPN-клиента
         resp2 = fetch(url, VPN_HEADERS)
         ct2 = resp2.headers.get("Content-Type", "")
         body2 = resp2.text.strip()
@@ -500,11 +492,9 @@ def fetch_and_decode_configs(url: str) -> str:
         if not is_html(ct2, body2):
             return try_decode_base64(body2)
 
-        # Шаг 3: /sub/<token> — паттерн Marzban и похожих панелей
         base = url.rstrip("/")
-        # Извлекаем токен из последнего сегмента пути
         token = base.split("/")[-1]
-        origin = "/".join(base.split("/")[:-1])  # https://domain.com
+        origin = "/".join(base.split("/")[:-1])
 
         sub_candidates = [
             f"{origin}/sub/{token}",
@@ -523,7 +513,6 @@ def fetch_and_decode_configs(url: str) -> str:
             except Exception:
                 continue
 
-        # Ничего не сработало — вернём тело как есть, бот попробует найти ключи
         return body2
 
     except requests.exceptions.RequestException as e:
@@ -535,7 +524,6 @@ def extract_keys(text: str) -> list:
     keys = KEY_PATTERN.findall(text)
     if keys:
         return keys
-    # Fallback: возможно, это не список ссылок, а JSON-конфиг(и) Xray/V2Ray
     return convert_xray_json_to_links(text)
 
 def send_keys(chat_id: int, keys: list):
@@ -555,7 +543,66 @@ def send_keys(chat_id: int, keys: list):
         if os.path.exists(file_name):
             os.remove(file_name)
 
-# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+# ==================== НОВЫЕ КОМАНДЫ ДЛЯ HWID ====================
+
+@bot.message_handler(commands=['hwid'])
+def cmd_hwid(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
+
+    parts = message.text.strip().split(maxsplit=2)
+    if len(parts) < 3:
+        safe_reply_to(message, with_footer(
+            "Использование: /hwid <HWID> <содержимое>\n"
+            "Пример: /hwid ABC123 vless://...\n"
+            "HWID может быть любым текстом, который будет проверяться при переходе по ссылке."
+        ))
+        return
+
+    hwid = parts[1].strip()
+    content = parts[2].strip()
+
+    if not hwid:
+        safe_reply_to(message, with_footer("HWID не может быть пустым."))
+        return
+
+    code = save_link('hwid', content, message.from_user.id, hwid)
+    short_url = build_short_url(code)
+
+    safe_reply_to(message, with_footer(
+        f"✅ HWID-ссылка создана!\n"
+        f"Ваш HWID: `{hwid}`\n"
+        f"Ссылка: {short_url}?hwid={hwid}\n\n"
+        f"⚠️ Доступ к содержимому будет только при передаче правильного HWID в параметре `hwid` или `payload`."
+    ), parse_mode="Markdown")
+
+@bot.message_handler(commands=['hwid_auto'])
+def cmd_hwid_auto(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
+
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        safe_reply_to(message, with_footer("Использование: /hwid_auto <содержимое>\nHWID будет сгенерирован автоматически на основе вашего Telegram ID."))
+        return
+
+    content = parts[1].strip()
+    # Генерируем HWID как tg_<id>_<рандом>
+    hwid = f"tg_{message.from_user.id}_{random.randint(1000, 9999)}"
+
+    code = save_link('hwid', content, message.from_user.id, hwid)
+    short_url = build_short_url(code)
+
+    safe_reply_to(message, with_footer(
+        f"✅ HWID-ссылка создана!\n"
+        f"Ваш HWID: `{hwid}`\n"
+        f"Ссылка: {short_url}?hwid={hwid}\n\n"
+        f"⚠️ Сохраните HWID — он понадобится для доступа."
+    ), parse_mode="Markdown")
+
+# ==================== ОБРАБОТЧИКИ КОМАНД (уже существующие) ====================
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -569,6 +616,8 @@ def send_welcome(message):
         "• Отправьте обычную ссылку (**http://...** или **https://...**), чтобы скачать подписку и достать из неё VPN-ключи.\n"
         "• Команда /addkeys — чтобы сохранить свои ключи и получить короткую ссылку на них.\n"
         "• Команда /shorten — чтобы сократить любую ссылку (оригинал будет скрыт).\n"
+        "• Команда /hwid — создать ссылку с защитой по HWID (указываете сами).\n"
+        "• Команда /hwid_auto — создать ссылку с автоматической генерацией HWID.\n"
         "• Команда /profile — посмотреть, изменить или удалить свои сохранённые ссылки."
     )
     safe_reply_to(message, with_footer(welcome_text), parse_mode="Markdown")
@@ -611,7 +660,7 @@ def process_addkeys(message):
             return
 
         content = "\n".join(keys)
-        code = save_link('keys', content, message.from_user.id)
+        code = save_link('keys', content, message.from_user.id, None)  # без HWID
         short_url = build_short_url(code)
 
         safe_reply_to(message, with_footer(
@@ -657,7 +706,7 @@ def process_shorten(message):
             ))
             return
 
-        code = save_link('url', text, message.from_user.id)
+        code = save_link('url', text, message.from_user.id, None)  # без HWID
         short_url = build_short_url(code)
 
         safe_reply_to(message, with_footer(f"Готово! Короткая ссылка:\n{short_url}"))
@@ -668,16 +717,15 @@ def process_shorten(message):
         except Exception:
             pass
 
-# ==================== ПРОФИЛЬ: компактное меню → детали по нажатию ====================
+# ==================== ПРОФИЛЬ (без изменений, но теперь видно только обычные ссылки, HWID-ссылки тоже отображаются) ====================
 
 def build_profile_menu(rows: list) -> telebot.types.InlineKeyboardMarkup:
-    """
-    Строит вертикальное меню: каждая кнопка — одна ссылка.
-    Формат: «🔗 /AbCd123» или «🔑 /AbCd123»
-    """
     markup = telebot.types.InlineKeyboardMarkup()
     for code, link_type, content, created_at in rows:
         icon = "🔗" if link_type == 'url' else "🔑"
+        # для hwid-ссылок тоже используем ключ
+        if link_type == 'hwid':
+            icon = "🛡️"
         markup.add(
             telebot.types.InlineKeyboardButton(
                 text=f"{icon}  /{code}",
@@ -696,7 +744,7 @@ def cmd_profile(message):
 
     if not rows:
         safe_reply_to(message, with_footer(
-            "У вас пока нет сохранённых ссылок. Создайте их через /shorten или /addkeys."
+            "У вас пока нет сохранённых ссылок. Создайте их через /shorten, /addkeys, /hwid или /hwid_auto."
         ))
         return
 
@@ -716,12 +764,14 @@ def handle_view_link(call):
         bot.answer_callback_query(call.id, "Ссылка не найдена или не ваша.", show_alert=True)
         return
 
-    link_type, content, _ = row
+    link_type, content, owner_id, hwid = row
     short_url = build_short_url(code)
-    type_label = "🔗 Ссылка" if link_type == 'url' else "🔑 Ключи"
+    type_label = "🔗 Ссылка" if link_type == 'url' else ("🛡️ HWID-ссылка" if link_type == 'hwid' else "🔑 Ключи")
     preview = content if len(content) <= 200 else content[:197] + "..."
 
     text = f"{type_label}\n{short_url}\n\n{preview}"
+    if hwid:
+        text += f"\n\n🔐 HWID: `{hwid}`"
 
     markup = telebot.types.InlineKeyboardMarkup()
     markup.row(
@@ -738,10 +788,11 @@ def handle_view_link(call):
             with_footer(text),
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=markup
+            reply_markup=markup,
+            parse_mode="Markdown"
         )
     except Exception:
-        safe_send_message(call.message.chat.id, with_footer(text), reply_markup=markup)
+        safe_send_message(call.message.chat.id, with_footer(text), reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data == "profile_back")
 def handle_profile_back(call):
@@ -777,7 +828,6 @@ def handle_delete_link(call):
 
     if success:
         bot.answer_callback_query(call.id, "Удалено ✅")
-        # После удаления возвращаемся к обновлённому списку
         rows = get_links_by_owner(call.from_user.id)
         if not rows:
             try:
@@ -816,6 +866,8 @@ def handle_edit_link(call):
 
     if link_type == 'url':
         prompt = f"Пришлите новую ссылку (http:// или https://) вместо старой для {build_short_url(code)}:"
+    elif link_type == 'hwid':
+        prompt = f"Пришлите новое содержимое (ключа или текст) для HWID-ссылки {build_short_url(code)}:"
     else:
         prompt = f"Пришлите новые ключи (вместо старых) для {build_short_url(code)}:"
 
@@ -837,13 +889,13 @@ def process_edit_link(message, code, link_type, owner_id):
                 return
             new_content = new_text
         else:
+            # Для ключей и HWID-ссылок — пробуем извлечь ключи, если есть
             keys = extract_keys(new_text)
-            if not keys:
-                safe_reply_to(message, with_footer(
-                    "Не нашёл ни одного ключа в сообщении. Изменения отменены, ключи остались прежними."
-                ))
-                return
-            new_content = "\n".join(keys)
+            if keys:
+                new_content = "\n".join(keys)
+            else:
+                # Если ключей нет, сохраняем как есть (может быть обычный текст)
+                new_content = new_text
 
         success = update_link_content(code, owner_id, new_content)
 
@@ -921,7 +973,7 @@ def handle_text_inner(message):
     else:
         safe_reply_to(message, with_footer(
             "Неверный формат. Отправьте либо ссылку **happ://crypt...**, либо обычную ссылку на подписку (**http://...**), "
-            "либо используйте /addkeys или /shorten."
+            "либо используйте /addkeys, /shorten, /hwid или /hwid_auto."
         ), parse_mode="Markdown")
 
 # ==================== ЗАПУСК ====================
