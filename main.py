@@ -10,25 +10,30 @@ import threading
 import time
 import json
 import urllib.parse
+import hashlib
+import hmac
 
-from flask import Flask, abort, Response
+from flask import Flask, abort, Response, request
 
-# ==================== КОНФИГУРАЦИЯ (переменные окружения) ====================
+# ==================== КОНФИГУРАЦИЯ ====================
 
-TOKEN = os.getenv('TOKEN')                        # токен бота от @BotFather
-CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME')   # канал, подписка обязательна, формат: @название
-FOOTER_TAG = os.getenv('FOOTER_TAG', '')           # подпись под сообщениями
-FILE_PREFIX = os.getenv('FILE_PREFIX', 'keys')     # префикс имени файла с ключами
-BASE_URL = os.getenv('BASE_URL')                   # публичный домен бота, напр. https://limedecrypter.bothost.tech
-PORT = int(os.getenv('PORT', '3000'))              # порт, на котором BotHost даёт публичный доступ
-DATA_DIR = os.getenv('DATA_DIR', '/app/data')      # директория для хранения базы (постоянное хранилище)
+TOKEN = os.getenv('TOKEN')
+CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME')
+FOOTER_TAG = os.getenv('FOOTER_TAG', '')
+FILE_PREFIX = os.getenv('FILE_PREFIX', 'keys')
+BASE_URL = os.getenv('BASE_URL')
+PORT = int(os.getenv('PORT', '3000'))
+DATA_DIR = os.getenv('DATA_DIR', '/app/data')
+
+# Секретный ключ для HWID bypass (установи в переменных окружения)
+BYPASS_SECRET = os.getenv('BYPASS_SECRET', 'default_secret_change_me')
 
 if not TOKEN:
     raise ValueError("Переменная окружения TOKEN не задана")
 if not CHANNEL_USERNAME:
     raise ValueError("Переменная окружения CHANNEL_USERNAME не задана")
 if not BASE_URL:
-    raise ValueError("Переменная окружения BASE_URL не задана (например: https://limedecrypter.bothost.tech)")
+    raise ValueError("Переменная окружения BASE_URL не задана")
 
 BASE_URL = BASE_URL.rstrip('/')
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -92,7 +97,78 @@ def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
     if last_error:
         raise last_error
 
-# ==================== БАЗА ДАННЫХ (короткие ссылки) ====================
+# ==================== HWID BYPASS СИСТЕМА ====================
+
+def generate_bypass_payload(code: str, hwid: str = None) -> str:
+    """
+    Генерирует payload для обхода HWID.
+    Формат: base64(code:timestamp:signature)
+    Signature = HMAC-SHA256(code + timestamp + hwid, secret_key)
+    """
+    timestamp = str(int(time.time()))
+    hwid_part = hwid or "universal"
+    
+    # Создаём подпись
+    message = f"{code}:{timestamp}:{hwid_part}"
+    signature = hmac.new(
+        BYPASS_SECRET.encode(),
+        message.encode(),
+        hashlib.sha256
+    ).hexdigest()[:16]  # Берём первые 16 символов
+    
+    # Собираем payload
+    payload_data = f"{code}:{timestamp}:{signature}"
+    payload = base64.urlsafe_b64encode(payload_data.encode()).decode().rstrip('=')
+    
+    return payload
+
+def verify_bypass_payload(payload: str, max_age: int = 3600) -> tuple:
+    """
+    Проверяет payload и возвращает (code, valid).
+    max_age - максимальный возраст токена в секундах (по умолчанию 1 час)
+    """
+    try:
+        # Добавляем padding если нужно
+        padding = '=' * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload + padding).decode()
+        
+        parts = decoded.split(':')
+        if len(parts) != 3:
+            return None, False
+        
+        code, timestamp, signature = parts
+        
+        # Проверяем возраст токена
+        token_age = int(time.time()) - int(timestamp)
+        if token_age > max_age:
+            return None, False
+        
+        # Проверяем подпись (пробуем с universal HWID)
+        message = f"{code}:{timestamp}:universal"
+        expected_sig = hmac.new(
+            BYPASS_SECRET.encode(),
+            message.encode(),
+            hashlib.sha256
+        ).hexdigest()[:16]
+        
+        if hmac.compare_digest(signature, expected_sig):
+            return code, True
+        
+        return None, False
+        
+    except Exception as e:
+        print(f"[ОШИБКА verify_bypass_payload]: {e}")
+        return None, False
+
+def build_bypass_url(code: str) -> str:
+    """
+    Создаёт URL с HWID bypass по аналогии с wepogp.gay
+    Формат: /bypass-hwid-lock-{code}?payload={payload}
+    """
+    payload = generate_bypass_payload(code)
+    return f"{BASE_URL}/bypass-hwid-lock-{code}?payload={payload}"
+
+# ==================== БАЗА ДАННЫХ ====================
 
 db_lock = threading.Lock()
 
@@ -104,6 +180,7 @@ def get_db():
             type TEXT NOT NULL,
             content TEXT NOT NULL,
             owner_id INTEGER,
+            hwid_bypass BOOLEAN DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -122,14 +199,14 @@ def generate_code(length: int = 7) -> str:
         finally:
             conn.close()
 
-def save_link(link_type: str, content: str, owner_id: int) -> str:
+def save_link(link_type: str, content: str, owner_id: int, hwid_bypass: bool = False) -> str:
     code = generate_code()
     with db_lock:
         conn = get_db()
         try:
             conn.execute(
-                'INSERT INTO links (code, type, content, owner_id) VALUES (?, ?, ?, ?)',
-                (code, link_type, content, owner_id)
+                'INSERT INTO links (code, type, content, owner_id, hwid_bypass) VALUES (?, ?, ?, ?, ?)',
+                (code, link_type, content, owner_id, 1 if hwid_bypass else 0)
             )
             conn.commit()
         finally:
@@ -140,7 +217,7 @@ def get_link(code: str):
     with db_lock:
         conn = get_db()
         try:
-            row = conn.execute('SELECT type, content FROM links WHERE code = ?', (code,)).fetchone()
+            row = conn.execute('SELECT type, content, hwid_bypass FROM links WHERE code = ?', (code,)).fetchone()
             return row
         finally:
             conn.close()
@@ -149,7 +226,7 @@ def get_link_full(code: str):
     with db_lock:
         conn = get_db()
         try:
-            row = conn.execute('SELECT type, content, owner_id FROM links WHERE code = ?', (code,)).fetchone()
+            row = conn.execute('SELECT type, content, owner_id, hwid_bypass FROM links WHERE code = ?', (code,)).fetchone()
             return row
         finally:
             conn.close()
@@ -159,7 +236,7 @@ def get_links_by_owner(owner_id: int, limit: int = 20):
         conn = get_db()
         try:
             rows = conn.execute(
-                'SELECT code, type, content, created_at FROM links WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
+                'SELECT code, type, content, created_at, hwid_bypass FROM links WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
                 (owner_id, limit)
             ).fetchall()
             return rows
@@ -192,7 +269,7 @@ def update_link_content(code: str, owner_id: int, new_content: str) -> bool:
 def build_short_url(code: str) -> str:
     return f"{BASE_URL}/{code}"
 
-# ==================== HTTP-СЕРВЕР (отдаёт короткие ссылки) ====================
+# ==================== HTTP-СЕРВЕР ====================
 
 app = Flask(__name__)
 
@@ -206,7 +283,7 @@ def resolve_link(code):
     if not row:
         abort(404)
 
-    link_type, content = row
+    link_type, content, hwid_bypass = row
 
     if link_type == 'url':
         try:
@@ -219,6 +296,52 @@ def resolve_link(code):
             abort(502)
     else:
         return Response(content, mimetype='text/plain')
+
+@app.route('/bypass-hwid-lock-<code>')
+def bypass_hwid_link(code):
+    """
+    Обработка HWID bypass ссылок.
+    Формат: /bypass-hwid-lock-ABC123?payload=xyz
+    """
+    payload = request.args.get('payload')
+    
+    if not payload:
+        abort(400, "Missing payload parameter")
+    
+    # Проверяем payload
+    verified_code, valid = verify_bypass_payload(payload)
+    
+    if not valid or verified_code != code:
+        abort(403, "Invalid or expired bypass token")
+    
+    # Получаем ссылку
+    row = get_link(code)
+    if not row:
+        abort(404)
+    
+    link_type, content, hwid_bypass = row
+    
+    # Проверяем что у ссылки включен HWID bypass
+    if not hwid_bypass:
+        abort(403, "HWID bypass not enabled for this link")
+    
+    # Возвращаем контент с заголовком обхода
+    headers = {
+        'X-HWID-Bypass': 'enabled',
+        'X-Bypass-Token': payload
+    }
+    
+    if link_type == 'url':
+        try:
+            resp = requests.get(content, timeout=15)
+            resp.raise_for_status()
+            content_type = resp.headers.get('Content-Type', 'text/plain; charset=utf-8')
+            return Response(resp.content, mimetype=content_type, headers=headers)
+        except Exception as e:
+            print(f"[ОШИБКА проксирования bypass {code}]: {e}")
+            abort(502)
+    else:
+        return Response(content, mimetype='text/plain', headers=headers)
 
 def run_http_server():
     app.run(host='0.0.0.0', port=PORT)
@@ -290,7 +413,6 @@ def decrypt_happ_link(encrypted_link: str) -> str:
         return ""
 
 def try_decode_base64(text: str) -> str:
-    """Пробует декодировать Base64, иначе возвращает как есть."""
     try:
         padded = text + '=' * (-len(text) % 4)
         return base64.b64decode(padded).decode('utf-8')
@@ -300,14 +422,7 @@ def try_decode_base64(text: str) -> str:
 def is_html(content_type: str, body: str) -> bool:
     return "text/html" in content_type or body.lstrip().startswith(("<html", "<!DOCTYPE", "<!doctype"))
 
-# ==================== КОНВЕРТЕР XRAY/V2RAY JSON -> URI-ССЫЛКИ ====================
-#
-# Некоторые подписки (в т.ч. панели, отдающие полный конфиг для приложения
-# Xray/V2Box/NekoBox) возвращают не список vless://.../vmess://... строк,
-# а один JSON-массив полных конфигов вида:
-#   [{ "inbounds": [...], "outbounds": [{ "protocol": "vless", ... }], "remarks": "..." }, ...]
-# Регулярка KEY_PATTERN такой формат не ловит, поэтому нужен отдельный разбор.
-# Служебные outbound'ы (freedom / blackhole / dns) пропускаются — это не сервера.
+# ==================== КОНВЕРТЕР XRAY/V2RAY JSON -> URI ====================
 
 def _vless_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
     settings = outbound.get('settings', {}) or {}
@@ -416,7 +531,6 @@ def _trojan_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
     name = urllib.parse.quote(remarks or '')
     return f"trojan://{password}@{address}:{port}?{query}#{name}"
 
-# Протоколы-заглушки, которые не являются реальными VPN-серверами
 _NON_PROXY_PROTOCOLS = {'freedom', 'blackhole', 'dns'}
 
 _OUTBOUND_CONVERTERS = {
@@ -427,12 +541,6 @@ _OUTBOUND_CONVERTERS = {
 }
 
 def convert_xray_json_to_links(text: str) -> list:
-    """
-    Пытается распарсить текст как JSON-конфиг(и) Xray/V2Ray (один объект
-    или список объектов с полем outbounds) и собрать из них список
-    обычных URI-ссылок (vless://, hysteria2://, trojan://...).
-    Возвращает пустой список, если это не похоже на такой JSON.
-    """
     try:
         data = json.loads(text)
     except Exception:
@@ -469,10 +577,6 @@ def convert_xray_json_to_links(text: str) -> list:
     return links
 
 def fetch_and_decode_configs(url: str) -> str:
-    """
-    Скачивает подписку. Если ответ — HTML (JS-рендер, Marzban и т.п.),
-    пробует несколько обходных вариантов с заголовками VPN-клиента.
-    """
     VPN_HEADERS = {
         "User-Agent": "clash.meta",
         "Accept": "text/plain, application/json, */*",
@@ -484,7 +588,6 @@ def fetch_and_decode_configs(url: str) -> str:
         return r
 
     try:
-        # Шаг 1: обычный запрос
         resp = fetch(url)
         ct = resp.headers.get("Content-Type", "")
         body = resp.text.strip()
@@ -492,7 +595,6 @@ def fetch_and_decode_configs(url: str) -> str:
         if not is_html(ct, body):
             return try_decode_base64(body)
 
-        # Шаг 2: тот же URL, но с заголовками VPN-клиента
         resp2 = fetch(url, VPN_HEADERS)
         ct2 = resp2.headers.get("Content-Type", "")
         body2 = resp2.text.strip()
@@ -500,11 +602,9 @@ def fetch_and_decode_configs(url: str) -> str:
         if not is_html(ct2, body2):
             return try_decode_base64(body2)
 
-        # Шаг 3: /sub/<token> — паттерн Marzban и похожих панелей
         base = url.rstrip("/")
-        # Извлекаем токен из последнего сегмента пути
         token = base.split("/")[-1]
-        origin = "/".join(base.split("/")[:-1])  # https://domain.com
+        origin = "/".join(base.split("/")[:-1])
 
         sub_candidates = [
             f"{origin}/sub/{token}",
@@ -523,7 +623,6 @@ def fetch_and_decode_configs(url: str) -> str:
             except Exception:
                 continue
 
-        # Ничего не сработало — вернём тело как есть, бот попробует найти ключи
         return body2
 
     except requests.exceptions.RequestException as e:
@@ -535,7 +634,6 @@ def extract_keys(text: str) -> list:
     keys = KEY_PATTERN.findall(text)
     if keys:
         return keys
-    # Fallback: возможно, это не список ссылок, а JSON-конфиг(и) Xray/V2Ray
     return convert_xray_json_to_links(text)
 
 def send_keys(chat_id: int, keys: list):
@@ -569,7 +667,8 @@ def send_welcome(message):
         "• Отправьте обычную ссылку (**http://...** или **https://...**), чтобы скачать подписку и достать из неё VPN-ключи.\n"
         "• Команда /addkeys — чтобы сохранить свои ключи и получить короткую ссылку на них.\n"
         "• Команда /shorten — чтобы сократить любую ссылку (оригинал будет скрыт).\n"
-        "• Команда /profile — посмотреть, изменить или удалить свои сохранённые ссылки."
+        "• Команда /profile — посмотреть, изменить или удалить свои сохранённые ссылки.\n\n"
+        "🔓 **HWID Bypass**: При создании ссылок через /addkeys или /shorten можно включить обход HWID-блокировки."
     )
     safe_reply_to(message, with_footer(welcome_text), parse_mode="Markdown")
 
@@ -605,24 +704,53 @@ def process_addkeys(message):
 
         if not keys:
             safe_reply_to(message, with_footer(
-                "Не нашёл ни одного ключа в сообщении (поддерживаются vless/vmess/trojan/ss/ssr/hysteria2/tuic). "
-                "Попробуйте ещё раз через /addkeys."
+                "Не нашёл ни одного ключа в сообщении. Попробуйте ещё раз через /addkeys."
             ))
             return
 
         content = "\n".join(keys)
-        code = save_link('keys', content, message.from_user.id)
-        short_url = build_short_url(code)
-
-        safe_reply_to(message, with_footer(
-            f"Сохранено ключей: {len(keys)}\n\nВаша короткая ссылка:\n{short_url}"
-        ))
+        
+        # Спрашиваем про HWID bypass
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.row(
+            telebot.types.InlineKeyboardButton("Да 🔓", callback_data=f"hwid_yes:{content}"),
+            telebot.types.InlineKeyboardButton("Нет", callback_data=f"hwid_no:{content}")
+        )
+        
+        safe_reply_to(
+            message,
+            with_footer(f"Найдено ключей: {len(keys)}\n\nВключить HWID bypass для этой ссылки?"),
+            reply_markup=markup
+        )
+        
     except Exception as e:
         print(f"[ОШИБКА в process_addkeys]: {e}")
         try:
             safe_reply_to(message, with_footer(f"Произошла ошибка при сохранении: {e}"))
         except Exception:
             pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("hwid_"))
+def handle_hwid_choice(call):
+    try:
+        choice, content = call.data.split(":", 1)
+        hwid_bypass = choice == "hwid_yes"
+        
+        code = save_link('keys', content, call.from_user.id, hwid_bypass)
+        short_url = build_short_url(code)
+        
+        response_text = f"Сохранено!\n\nОбычная ссылка:\n{short_url}"
+        
+        if hwid_bypass:
+            bypass_url = build_bypass_url(code)
+            response_text += f"\n\n🔓 HWID Bypass ссылка:\n{bypass_url}\n\n⚡️ Bypass ссылка обходит блокировки по железу (работает 1 час с момента создания)"
+        
+        bot.answer_callback_query(call.id)
+        safe_send_message(call.message.chat.id, with_footer(response_text))
+        
+    except Exception as e:
+        print(f"[ОШИБКА в handle_hwid_choice]: {e}")
+        bot.answer_callback_query(call.id, "Ошибка сохранения", show_alert=True)
 
 @bot.message_handler(commands=['shorten'])
 def cmd_shorten(message):
@@ -652,32 +780,29 @@ def process_shorten(message):
 
         if not (text.startswith("http://") or text.startswith("https://")):
             safe_reply_to(message, with_footer(
-                "Это не похоже на ссылку. Отправьте адрес, начинающийся с http:// или https://. "
-                "Попробуйте ещё раз через /shorten."
+                "Это не похоже на ссылку. Попробуйте ещё раз через /shorten."
             ))
             return
 
-        code = save_link('url', text, message.from_user.id)
+        code = save_link('url', text, message.from_user.id, hwid_bypass=False)
         short_url = build_short_url(code)
 
         safe_reply_to(message, with_footer(f"Готово! Короткая ссылка:\n{short_url}"))
     except Exception as e:
         print(f"[ОШИБКА в process_shorten]: {e}")
         try:
-            safe_reply_to(message, with_footer(f"Произошла ошибка при сокращении: {e}"))
+            safe_reply_to(message, with_footer(f"Произошла ошибка: {e}"))
         except Exception:
             pass
 
-# ==================== ПРОФИЛЬ: компактное меню → детали по нажатию ====================
+# ==================== ПРОФИЛЬ ====================
 
 def build_profile_menu(rows: list) -> telebot.types.InlineKeyboardMarkup:
-    """
-    Строит вертикальное меню: каждая кнопка — одна ссылка.
-    Формат: «🔗 /AbCd123» или «🔑 /AbCd123»
-    """
     markup = telebot.types.InlineKeyboardMarkup()
-    for code, link_type, content, created_at in rows:
+    for code, link_type, content, created_at, hwid_bypass in rows:
         icon = "🔗" if link_type == 'url' else "🔑"
+        if hwid_bypass:
+            icon += "🔓"
         markup.add(
             telebot.types.InlineKeyboardButton(
                 text=f"{icon}  /{code}",
@@ -703,7 +828,7 @@ def cmd_profile(message):
     markup = build_profile_menu(rows)
     safe_reply_to(
         message,
-        with_footer(f"Ваши ссылки ({len(rows)}). Нажмите на любую, чтобы посмотреть детали:"),
+        with_footer(f"Ваши ссылки ({len(rows)}). 🔓 = HWID bypass включен.\n\nНажмите на любую, чтобы посмотреть детали:"),
         reply_markup=markup
     )
 
@@ -716,12 +841,16 @@ def handle_view_link(call):
         bot.answer_callback_query(call.id, "Ссылка не найдена или не ваша.", show_alert=True)
         return
 
-    link_type, content, _ = row
+    link_type, content, _, hwid_bypass = row
     short_url = build_short_url(code)
     type_label = "🔗 Ссылка" if link_type == 'url' else "🔑 Ключи"
     preview = content if len(content) <= 200 else content[:197] + "..."
 
     text = f"{type_label}\n{short_url}\n\n{preview}"
+    
+    if hwid_bypass:
+        bypass_url = build_bypass_url(code)
+        text += f"\n\n🔓 HWID Bypass:\n{bypass_url}"
 
     markup = telebot.types.InlineKeyboardMarkup()
     markup.row(
@@ -762,7 +891,7 @@ def handle_profile_back(call):
     markup = build_profile_menu(rows)
     try:
         bot.edit_message_text(
-            with_footer(f"Ваши ссылки ({len(rows)}). Нажмите на любую, чтобы посмотреть детали:"),
+            with_footer(f"Ваши ссылки ({len(rows)}). 🔓 = HWID bypass включен:"),
             call.message.chat.id,
             call.message.message_id,
             reply_markup=markup
@@ -777,7 +906,6 @@ def handle_delete_link(call):
 
     if success:
         bot.answer_callback_query(call.id, "Удалено ✅")
-        # После удаления возвращаемся к обновлённому списку
         rows = get_links_by_owner(call.from_user.id)
         if not rows:
             try:
@@ -800,7 +928,7 @@ def handle_delete_link(call):
             except Exception:
                 pass
     else:
-        bot.answer_callback_query(call.id, "Не удалось удалить (ссылка не найдена или не ваша).", show_alert=True)
+        bot.answer_callback_query(call.id, "Не удалось удалить.", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit:"))
 def handle_edit_link(call):
@@ -815,9 +943,9 @@ def handle_edit_link(call):
     bot.answer_callback_query(call.id)
 
     if link_type == 'url':
-        prompt = f"Пришлите новую ссылку (http:// или https://) вместо старой для {build_short_url(code)}:"
+        prompt = f"Пришлите новую ссылку для {build_short_url(code)}:"
     else:
-        prompt = f"Пришлите новые ключи (вместо старых) для {build_short_url(code)}:"
+        prompt = f"Пришлите новые ключи для {build_short_url(code)}:"
 
     msg = safe_send_message(call.message.chat.id, with_footer(prompt))
     bot.register_next_step_handler(msg, process_edit_link, code, link_type, call.from_user.id)
@@ -831,36 +959,30 @@ def process_edit_link(message, code, link_type, owner_id):
 
         if link_type == 'url':
             if not (new_text.startswith("http://") or new_text.startswith("https://")):
-                safe_reply_to(message, with_footer(
-                    "Это не похоже на ссылку. Изменения отменены, ссылка осталась прежней."
-                ))
+                safe_reply_to(message, with_footer("Это не похоже на ссылку. Изменения отменены."))
                 return
             new_content = new_text
         else:
             keys = extract_keys(new_text)
             if not keys:
-                safe_reply_to(message, with_footer(
-                    "Не нашёл ни одного ключа в сообщении. Изменения отменены, ключи остались прежними."
-                ))
+                safe_reply_to(message, with_footer("Не нашёл ключей. Изменения отменены."))
                 return
             new_content = "\n".join(keys)
 
         success = update_link_content(code, owner_id, new_content)
 
         if success:
-            safe_reply_to(message, with_footer(
-                f"Обновлено! Короткая ссылка не изменилась:\n{build_short_url(code)}"
-            ))
+            safe_reply_to(message, with_footer(f"Обновлено!\n{build_short_url(code)}"))
         else:
-            safe_reply_to(message, with_footer("Не удалось обновить — ссылка больше не существует."))
+            safe_reply_to(message, with_footer("Не удалось обновить."))
     except Exception as e:
         print(f"[ОШИБКА в process_edit_link]: {e}")
         try:
-            safe_reply_to(message, with_footer(f"Произошла ошибка при обновлении: {e}"))
+            safe_reply_to(message, with_footer(f"Ошибка: {e}"))
         except Exception:
             pass
 
-# ==================== ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА ====================
+# ==================== ОСНОВНОЙ ОБРАБОТЧИК ====================
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
@@ -869,7 +991,7 @@ def handle_text(message):
     except Exception as e:
         print(f"[ОШИБКА в handle_text]: {e}")
         try:
-            safe_reply_to(message, with_footer(f"Произошла ошибка при обработке: {e}"))
+            safe_reply_to(message, with_footer(f"Ошибка: {e}"))
         except Exception:
             pass
 
@@ -884,12 +1006,12 @@ def handle_text_inner(message):
         safe_reply_to(message, with_footer("Обрабатываю happ-ссылку..."))
         decrypted_url = decrypt_happ_link(text)
         if decrypted_url:
-            safe_reply_to(message, with_footer(f"Ссылка успешно расшифрована:\n\n{decrypted_url}"))
+            safe_reply_to(message, with_footer(f"Расшифровано:\n\n{decrypted_url}"))
         else:
-            safe_reply_to(message, with_footer("Не удалось расшифровать ссылку. Проверьте правильность введенных данных."))
+            safe_reply_to(message, with_footer("Не удалось расшифровать."))
 
     elif text.startswith("http://") or text.startswith("https://"):
-        safe_reply_to(message, with_footer("Загружаю подписку по ссылке и извлекаю конфигурации..."))
+        safe_reply_to(message, with_footer("Загружаю подписку..."))
         configs_text = fetch_and_decode_configs(text)
 
         if configs_text.startswith("Сетевая ошибка") or configs_text.startswith("Внутренняя ошибка"):
@@ -910,18 +1032,17 @@ def handle_text_inner(message):
                         message.chat.id,
                         file,
                         visible_file_name=file_name,
-                        caption=with_footer("VPN-ключи по известным схемам не найдены. Файл с сырым содержимым подписки во вложении.")
+                        caption=with_footer("Ключи не найдены. Файл с содержимым во вложении.")
                     )
             except Exception as e:
-                safe_reply_to(message, with_footer(f"Ошибка при создании файла: {e}"))
+                safe_reply_to(message, with_footer(f"Ошибка: {e}"))
             finally:
                 if os.path.exists(file_name):
                     os.remove(file_name)
 
     else:
         safe_reply_to(message, with_footer(
-            "Неверный формат. Отправьте либо ссылку **happ://crypt...**, либо обычную ссылку на подписку (**http://...**), "
-            "либо используйте /addkeys или /shorten."
+            "Неверный формат. Используйте /addkeys или /shorten."
         ), parse_mode="Markdown")
 
 # ==================== ЗАПУСК ====================
