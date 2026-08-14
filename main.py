@@ -267,6 +267,19 @@ def update_link_content(code: str, owner_id: int, new_content: str) -> bool:
         finally:
             conn.close()
 
+def update_link_name_desc(code: str, owner_id: int, name: str, description: str) -> bool:
+    with db_lock:
+        conn = get_db()
+        try:
+            cur = conn.execute(
+                'UPDATE links SET name = ?, description = ? WHERE code = ? AND owner_id = ?',
+                (name, description, code, owner_id)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
 def build_short_url(code: str) -> str:
     return f"{BASE_URL}/{code}"
 
@@ -649,13 +662,175 @@ def send_welcome(message):
         "• Автоматически загружать подписки по **http://** или **https://** ссылкам и извлекать VPN-ключи (vless, vmess, trojan, ss, hysteria и др.).\n"
         "• /shorten — сократить ссылку на подписку с возможностью добавить название, описание и включить HWID-защиту (будет создана вечная bypass-ссылка).\n"
         "• /addkeys — сохранить свои ключи и получить короткую ссылку.\n"
-        "• /profile — посмотреть все свои сохранённые ссылки."
+        "• /profile — посмотреть все свои сохранённые ссылки, управлять ими (удалить, изменить)."
     )
     safe_reply_to(message, with_footer(welcome_text))
 
+# ==================== /profile с кнопками ====================
+
+def build_profile_menu(rows: list) -> telebot.types.InlineKeyboardMarkup:
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    for row in rows:
+        code, link_type, content, created_at, hwid_bypass, hwid, name, description = row
+        icon = "🔗" if link_type == 'url' else "🔑"
+        if hwid:
+            icon += "🔒"
+        if hwid_bypass:
+            icon += "🔓"
+        display_name = name if name else code
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                text=f"{icon} {display_name}",
+                callback_data=f"view:{code}"
+            )
+        )
+    return markup
+
+@bot.message_handler(commands=['profile'])
+def cmd_profile(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
+
+    rows = get_links_by_owner(message.from_user.id)
+
+    if not rows:
+        safe_reply_to(message, with_footer("У вас пока нет сохранённых ссылок."))
+        return
+
+    markup = build_profile_menu(rows)
+    safe_reply_to(
+        message,
+        with_footer(f"Ваши ссылки ({len(rows)}). Нажмите на любую для просмотра деталей:"),
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("view:"))
+def handle_view_link(call):
+    code = call.data.split(":", 1)[1]
+    row = get_link_full(code)
+
+    if not row or row[2] != call.from_user.id:
+        bot.answer_callback_query(call.id, "Ссылка не найдена или не ваша.", show_alert=True)
+        return
+
+    link_type, content, owner_id, hwid_bypass, hwid, name, description = row
+    short_url = build_short_url(code)
+    type_label = "🔗 Ссылка" if link_type == 'url' else "🔑 Ключи"
+    preview = content if len(content) <= 200 else content[:197] + "..."
+
+    text = f"{type_label}\n\n📌 Название: {name or '—'}\n📝 Описание: {description or '—'}\n🔗 {short_url}\n\n📄 Содержимое:\n{preview}"
+    if hwid:
+        text += f"\n\n🔐 HWID: `{hwid}`"
+    if hwid_bypass:
+        bypass_url = build_bypass_url(code)
+        text += f"\n\n🔓 Bypass-ссылка (вечная):\n{bypass_url}"
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(
+        telebot.types.InlineKeyboardButton("✏️ Изменить название/описание", callback_data=f"edit_meta:{code}"),
+        telebot.types.InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{code}")
+    )
+    markup.add(
+        telebot.types.InlineKeyboardButton("‹ Назад к списку", callback_data="profile_back")
+    )
+
+    bot.answer_callback_query(call.id)
+    try:
+        bot.edit_message_text(
+            with_footer(text),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        safe_send_message(call.message.chat.id, with_footer(text), reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "profile_back")
+def handle_profile_back(call):
+    rows = get_links_by_owner(call.from_user.id)
+    bot.answer_callback_query(call.id)
+    if not rows:
+        try:
+            bot.edit_message_text(
+                with_footer("У вас больше нет сохранённых ссылок."),
+                call.message.chat.id,
+                call.message.message_id
+            )
+        except Exception:
+            pass
+        return
+    markup = build_profile_menu(rows)
+    try:
+        bot.edit_message_text(
+            with_footer(f"Ваши ссылки ({len(rows)}). Нажмите на любую для просмотра деталей:"),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    except Exception:
+        pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del:"))
+def handle_delete_link(call):
+    code = call.data.split(":", 1)[1]
+    success = delete_link(code, call.from_user.id)
+    if success:
+        bot.answer_callback_query(call.id, "Удалено ✅")
+        rows = get_links_by_owner(call.from_user.id)
+        if not rows:
+            try:
+                bot.edit_message_text(
+                    with_footer("Ссылка удалена. Сохранённых ссылок больше нет."),
+                    call.message.chat.id,
+                    call.message.message_id
+                )
+            except Exception:
+                pass
+        else:
+            markup = build_profile_menu(rows)
+            try:
+                bot.edit_message_text(
+                    with_footer(f"Ссылка удалена. Ваши ссылки ({len(rows)}):"),
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+            except Exception:
+                pass
+    else:
+        bot.answer_callback_query(call.id, "Не удалось удалить (ссылка не найдена или не ваша).", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("edit_meta:"))
+def handle_edit_meta(call):
+    code = call.data.split(":", 1)[1]
+    row = get_link_full(code)
+    if not row or row[2] != call.from_user.id:
+        bot.answer_callback_query(call.id, "Ссылка не найдена или не ваша.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, "Введите новое название и описание в формате:\nНазвание\n---\nОписание")
+    msg = safe_send_message(call.message.chat.id, with_footer(f"Для {build_short_url(code)} введите новое название и описание (разделите строкой '---'):\n\nПример:\nМой VPN\n---\nОписание сервера"))
+    bot.register_next_step_handler(msg, process_edit_meta, code, call.from_user.id)
+
+def process_edit_meta(message, code, owner_id):
+    if message.from_user.id != owner_id:
+        return
+    text = (message.text or "").strip()
+    if '---' not in text:
+        safe_reply_to(message, with_footer("Не найден разделитель '---'. Изменения отменены."))
+        return
+    name, description = text.split('---', 1)
+    name = name.strip()
+    description = description.strip()
+    success = update_link_name_desc(code, owner_id, name, description)
+    if success:
+        safe_reply_to(message, with_footer("Название и описание обновлены!"))
+    else:
+        safe_reply_to(message, with_footer("Ошибка обновления."))
+
 # ==================== /shorten ====================
 
-# Словарь для хранения временных данных пользователя (url, name, description)
 user_data = {}
 user_data_lock = threading.Lock()
 
@@ -809,39 +984,7 @@ def process_addkeys(message):
         except Exception:
             pass
 
-# ==================== /profile ====================
-
-@bot.message_handler(commands=['profile'])
-def cmd_profile(message):
-    if not is_subscribed(message.from_user.id):
-        send_subscribe_prompt(message.chat.id)
-        return
-
-    rows = get_links_by_owner(message.from_user.id)
-
-    if not rows:
-        safe_reply_to(message, with_footer("У вас пока нет сохранённых ссылок."))
-        return
-
-    text = f"Ваши ссылки ({len(rows)}):\n\n"
-    for row in rows:
-        code, link_type, content, created_at, hwid_bypass, hwid, name, description = row
-        icon = "🔗" if link_type == 'url' else "🔑"
-        if hwid:
-            icon += "🔒"
-        if hwid_bypass:
-            icon += "🔓"
-        short_url = build_short_url(code)
-        text += f"{icon} {short_url}"
-        if name:
-            text += f" – {name}"
-        if hwid:
-            text += f" (HWID: {hwid})"
-        text += "\n"
-
-    safe_reply_to(message, with_footer(text))
-
-# ==================== ОБРАБОТЧИК ТЕКСТА (С АВТОМАТИЧЕСКОЙ ОБРАБОТКОЙ ССЫЛОК) ====================
+# ==================== ОБРАБОТЧИК ТЕКСТА ====================
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
@@ -852,7 +995,6 @@ def handle_text(message):
 
         text = message.text.strip()
 
-        # 1. happ://crypt – расшифровка
         if text.startswith("happ://crypt"):
             safe_reply_to(message, with_footer("Обрабатываю happ-ссылку..."))
             decrypted_url = decrypt_happ_link(text)
@@ -861,7 +1003,6 @@ def handle_text(message):
             else:
                 safe_reply_to(message, with_footer("Не удалось расшифровать ссылку."))
 
-        # 2. Обычная HTTP/HTTPS ссылка – загружаем подписку, извлекаем ключи
         elif text.startswith("http://") or text.startswith("https://"):
             safe_reply_to(message, with_footer("Загружаю подписку по ссылке и извлекаю конфигурации..."))
             configs_text = fetch_and_decode_configs(text)
