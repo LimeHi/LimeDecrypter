@@ -9,7 +9,7 @@ import random
 import threading
 import time
 
-from flask import Flask, redirect, abort, Response
+from flask import Flask, abort, Response
 
 # ==================== КОНФИГУРАЦИЯ (переменные окружения) ====================
 
@@ -43,7 +43,7 @@ def safe_send_message(chat_id, text, retries=3, delay=2, **kwargs):
     last_error = None
     for attempt in range(1, retries + 1):
         try:
-            return safe_send_message(chat_id, text, **kwargs)
+            return bot.send_message(chat_id, text, **kwargs)
         except requests.exceptions.ReadTimeout as e:
             last_error = e
             print(f"[Таймаут send_message, попытка {attempt}/{retries}]: {e}")
@@ -60,7 +60,7 @@ def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
     last_error = None
     for attempt in range(1, retries + 1):
         try:
-            return safe_send_document(chat_id, document, **kwargs)
+            return bot.send_document(chat_id, document, **kwargs)
         except requests.exceptions.ReadTimeout as e:
             last_error = e
             print(f"[Таймаут send_document, попытка {attempt}/{retries}]: {e}")
@@ -83,7 +83,7 @@ def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
     last_error = None
     for attempt in range(1, retries + 1):
         try:
-            return safe_reply_to(message, text, **kwargs)
+            return bot.reply_to(message, text, **kwargs)
         except requests.exceptions.ReadTimeout as e:
             last_error = e
             print(f"[Таймаут reply_to, попытка {attempt}/{retries}]: {e}")
@@ -149,6 +149,54 @@ def get_link(code: str):
         finally:
             conn.close()
 
+def get_link_full(code: str):
+    """Возвращает (type, content, owner_id) или None."""
+    with db_lock:
+        conn = get_db()
+        try:
+            row = conn.execute('SELECT type, content, owner_id FROM links WHERE code = ?', (code,)).fetchone()
+            return row
+        finally:
+            conn.close()
+
+def get_links_by_owner(owner_id: int, limit: int = 20):
+    """Возвращает список (code, type, content, created_at) для владельца, новые сначала."""
+    with db_lock:
+        conn = get_db()
+        try:
+            rows = conn.execute(
+                'SELECT code, type, content, created_at FROM links WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
+                (owner_id, limit)
+            ).fetchall()
+            return rows
+        finally:
+            conn.close()
+
+def delete_link(code: str, owner_id: int) -> bool:
+    """Удаляет ссылку, только если она принадлежит owner_id. Возвращает True при успехе."""
+    with db_lock:
+        conn = get_db()
+        try:
+            cur = conn.execute('DELETE FROM links WHERE code = ? AND owner_id = ?', (code, owner_id))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+def update_link_content(code: str, owner_id: int, new_content: str) -> bool:
+    """Обновляет содержимое ссылки, только если она принадлежит owner_id. Возвращает True при успехе."""
+    with db_lock:
+        conn = get_db()
+        try:
+            cur = conn.execute(
+                'UPDATE links SET content = ? WHERE code = ? AND owner_id = ?',
+                (new_content, code, owner_id)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
 def build_short_url(code: str) -> str:
     return f"{BASE_URL}/{code}"
 
@@ -169,8 +217,16 @@ def resolve_link(code):
     link_type, content = row
 
     if link_type == 'url':
-        # Скрываем оригинальную ссылку — просто редиректим на неё
-        return redirect(content, code=302)
+        # Не редиректим — сами скачиваем содержимое и отдаём его напрямую,
+        # чтобы оригинальный адрес нигде не светился и не было видимого перехода
+        try:
+            resp = requests.get(content, timeout=15)
+            resp.raise_for_status()
+            content_type = resp.headers.get('Content-Type', 'text/plain; charset=utf-8')
+            return Response(resp.content, mimetype=content_type)
+        except Exception as e:
+            print(f"[ОШИБКА проксирования {code}]: {e}")
+            abort(502)
     else:
         # type == 'keys' — отдаём сохранённые ключи как есть, обычным текстом
         return Response(content, mimetype='text/plain')
@@ -211,7 +267,7 @@ def send_subscribe_prompt(chat_id: int):
         text="Я подписался ✅",
         callback_data="check_sub"
     ))
-    bot.send_message(
+    safe_send_message(
         chat_id,
         with_footer(f"Для использования бота необходимо подписаться на канал {CHANNEL_USERNAME}."),
         reply_markup=markup
@@ -221,7 +277,7 @@ def send_subscribe_prompt(chat_id: int):
 def handle_check_sub(call):
     if is_subscribed(call.from_user.id):
         bot.answer_callback_query(call.id, "Подписка подтверждена ✅")
-        bot.send_message(call.message.chat.id, with_footer("Отлично! Теперь можешь пользоваться ботом."))
+        safe_send_message(call.message.chat.id, with_footer("Отлично! Теперь можешь пользоваться ботом."))
     else:
         bot.answer_callback_query(call.id, "Подписка не найдена. Подпишись и попробуй снова.", show_alert=True)
 
@@ -304,7 +360,8 @@ def send_welcome(message):
         "• Отправьте ссылку **happ://crypt...**, чтобы расшифровать её в URL.\n"
         "• Отправьте обычную ссылку (**http://...** или **https://...**), чтобы скачать подписку и достать из неё VPN-ключи.\n"
         "• Команда /addkeys — чтобы сохранить свои ключи и получить короткую ссылку на них.\n"
-        "• Команда /shorten — чтобы сократить любую ссылку (оригинал будет скрыт)."
+        "• Команда /shorten — чтобы сократить любую ссылку (оригинал будет скрыт).\n"
+        "• Команда /profile — посмотреть, изменить или удалить свои сохранённые ссылки."
     )
     safe_reply_to(message, with_footer(welcome_text), parse_mode="Markdown")
 
@@ -404,6 +461,115 @@ def process_shorten(message):
         print(f"[ОШИБКА в process_shorten]: {e}")
         try:
             safe_reply_to(message, with_footer(f"Произошла ошибка при сокращении: {e}"))
+        except Exception:
+            pass
+
+# ==================== ПРОФИЛЬ: список ссылок, удаление и редактирование ====================
+
+@bot.message_handler(commands=['profile'])
+def cmd_profile(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
+
+    rows = get_links_by_owner(message.from_user.id)
+
+    if not rows:
+        safe_reply_to(message, with_footer(
+            "У вас пока нет сохранённых ссылок. Создайте их через /shorten или /addkeys."
+        ))
+        return
+
+    safe_reply_to(message, with_footer(f"Ваши ссылки ({len(rows)}):"))
+
+    for code, link_type, content, created_at in rows:
+        short_url = build_short_url(code)
+        type_label = "🔗 Ссылка" if link_type == 'url' else "🔑 Ключи"
+        preview = content if len(content) <= 60 else content[:57] + "..."
+
+        text = f"{type_label}\n{short_url}\n\n{preview}"
+
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.row(
+            telebot.types.InlineKeyboardButton("✏️ Изменить", callback_data=f"edit:{code}"),
+            telebot.types.InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{code}")
+        )
+
+        safe_send_message(message.chat.id, text, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del:"))
+def handle_delete_link(call):
+    code = call.data.split(":", 1)[1]
+    success = delete_link(code, call.from_user.id)
+
+    if success:
+        bot.answer_callback_query(call.id, "Удалено ✅")
+        try:
+            bot.edit_message_text(
+                "🗑 Ссылка удалена.",
+                call.message.chat.id,
+                call.message.message_id
+            )
+        except Exception:
+            pass
+    else:
+        bot.answer_callback_query(call.id, "Не удалось удалить (ссылка не найдена или не ваша).", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("edit:"))
+def handle_edit_link(call):
+    code = call.data.split(":", 1)[1]
+    row = get_link_full(code)
+
+    if not row or row[2] != call.from_user.id:
+        bot.answer_callback_query(call.id, "Ссылка не найдена или не ваша.", show_alert=True)
+        return
+
+    link_type = row[0]
+    bot.answer_callback_query(call.id)
+
+    if link_type == 'url':
+        prompt = f"Пришлите новую ссылку (http:// или https://) вместо старой для {build_short_url(code)}:"
+    else:
+        prompt = f"Пришлите новые ключи (вместо старых) для {build_short_url(code)}:"
+
+    msg = safe_send_message(call.message.chat.id, with_footer(prompt))
+    bot.register_next_step_handler(msg, process_edit_link, code, link_type, call.from_user.id)
+
+def process_edit_link(message, code, link_type, owner_id):
+    try:
+        if message.from_user.id != owner_id:
+            return
+
+        new_text = (message.text or "").strip()
+
+        if link_type == 'url':
+            if not (new_text.startswith("http://") or new_text.startswith("https://")):
+                safe_reply_to(message, with_footer(
+                    "Это не похоже на ссылку. Изменения отменены, ссылка осталась прежней."
+                ))
+                return
+            new_content = new_text
+        else:
+            keys = extract_keys(new_text)
+            if not keys:
+                safe_reply_to(message, with_footer(
+                    "Не нашёл ни одного ключа в сообщении. Изменения отменены, ключи остались прежними."
+                ))
+                return
+            new_content = "\n".join(keys)
+
+        success = update_link_content(code, owner_id, new_content)
+
+        if success:
+            safe_reply_to(message, with_footer(
+                f"Обновлено! Короткая ссылка не изменилась:\n{build_short_url(code)}"
+            ))
+        else:
+            safe_reply_to(message, with_footer("Не удалось обновить — ссылка больше не существует."))
+    except Exception as e:
+        print(f"[ОШИБКА в process_edit_link]: {e}")
+        try:
+            safe_reply_to(message, with_footer(f"Произошла ошибка при обновлении: {e}"))
         except Exception:
             pass
 
