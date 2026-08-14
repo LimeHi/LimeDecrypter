@@ -43,62 +43,53 @@ bot = telebot.TeleBot(TOKEN)
 telebot.apihelper.READ_TIMEOUT = 60
 telebot.apihelper.CONNECT_TIMEOUT = 60
 
-# ==================== ВРЕМЕННОЕ ХРАНИЛИЩЕ (для callback data) ====================
+# ==================== ВРЕМЕННОЕ ХРАНИЛИЩЕ ====================
 
-pending_saves = {}  # {session_id: content}
+pending_saves = {}
 pending_saves_lock = threading.Lock()
 
 def create_pending_save(content: str) -> str:
-    """Сохраняет контент во временное хранилище, возвращает session_id"""
     session_id = str(uuid.uuid4())[:8]
     with pending_saves_lock:
         pending_saves[session_id] = content
+        print(f"[DEBUG] Created session {session_id}, content length: {len(content)}")
     return session_id
 
 def get_pending_save(session_id: str) -> str:
-    """Получает и удаляет контент из временного хранилища"""
     with pending_saves_lock:
-        return pending_saves.pop(session_id, None)
+        content = pending_saves.pop(session_id, None)
+        print(f"[DEBUG] Retrieved session {session_id}, found: {content is not None}")
+        return content
 
-# Очистка старых pending saves (каждые 5 минут)
 def cleanup_pending_saves():
     while True:
-        time.sleep(300)  # 5 минут
+        time.sleep(300)
         with pending_saves_lock:
-            # В продакшене можно добавить таймстемпы и удалять старше N минут
-            # Сейчас просто ограничиваем размер
             if len(pending_saves) > 1000:
-                # Удаляем половину (самые старые не отслеживаются, просто чистим)
                 keys = list(pending_saves.keys())[:500]
                 for k in keys:
                     pending_saves.pop(k, None)
+                print(f"[DEBUG] Cleaned {len(keys)} old sessions")
 
 cleanup_thread = threading.Thread(target=cleanup_pending_saves, daemon=True)
 cleanup_thread.start()
 
 def safe_send_message(chat_id, text, retries=3, delay=2, **kwargs):
-    last_error = None
     for attempt in range(1, retries + 1):
         try:
             return bot.send_message(chat_id, text, **kwargs)
         except requests.exceptions.ReadTimeout as e:
-            last_error = e
             print(f"[Таймаут send_message, попытка {attempt}/{retries}]: {e}")
             time.sleep(delay)
         except Exception as e:
-            last_error = e
             print(f"[Ошибка send_message]: {e}")
-            break
-    if last_error:
-        raise last_error
+            raise
 
 def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
-    last_error = None
     for attempt in range(1, retries + 1):
         try:
             return bot.send_document(chat_id, document, **kwargs)
         except requests.exceptions.ReadTimeout as e:
-            last_error = e
             print(f"[Таймаут send_document, попытка {attempt}/{retries}]: {e}")
             time.sleep(delay)
             if hasattr(document, 'seek'):
@@ -107,27 +98,19 @@ def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
                 except Exception:
                     pass
         except Exception as e:
-            last_error = e
             print(f"[Ошибка send_document]: {e}")
-            break
-    if last_error:
-        raise last_error
+            raise
 
 def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
-    last_error = None
     for attempt in range(1, retries + 1):
         try:
             return bot.reply_to(message, text, **kwargs)
         except requests.exceptions.ReadTimeout as e:
-            last_error = e
             print(f"[Таймаут reply_to, попытка {attempt}/{retries}]: {e}")
             time.sleep(delay)
         except Exception as e:
-            last_error = e
             print(f"[Ошибка reply_to]: {e}")
-            break
-    if last_error:
-        raise last_error
+            raise
 
 # ==================== HWID BYPASS ====================
 
@@ -215,6 +198,7 @@ def generate_code(length: int = 7) -> str:
 
 def save_link(link_type: str, content: str, owner_id: int, hwid_bypass: bool = False) -> str:
     code = generate_code()
+    print(f"[DEBUG] Saving link: type={link_type}, owner={owner_id}, bypass={hwid_bypass}, content_len={len(content)}")
     with db_lock:
         conn = get_db()
         try:
@@ -223,6 +207,10 @@ def save_link(link_type: str, content: str, owner_id: int, hwid_bypass: bool = F
                 (code, link_type, content, owner_id, 1 if hwid_bypass else 0)
             )
             conn.commit()
+            print(f"[DEBUG] Link saved successfully: {code}")
+        except Exception as e:
+            print(f"[ERROR] Database save failed: {e}")
+            raise
         finally:
             conn.close()
     return code
@@ -403,33 +391,9 @@ KEY_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-def decrypt_happ_link(encrypted_link: str) -> str:
-    endpoint = "https://api.ioo.ir/v1/happ/decrypt"
-    headers = {"Content-Type": "application/json"}
-    payload = {"link": encrypted_link}
-    try:
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("ok"):
-            return data.get("result", "")
-        return ""
-    except Exception as e:
-        print(f"Ошибка API дешифровки: {e}")
-        return ""
-
-def try_decode_base64(text: str) -> str:
-    try:
-        padded = text + '=' * (-len(text) % 4)
-        return base64.b64decode(padded).decode('utf-8')
-    except Exception:
-        return text
-
-def is_html(content_type: str, body: str) -> bool:
-    return "text/html" in content_type or body.lstrip().startswith(("<html", "<!DOCTYPE", "<!doctype"))
-
-# [Остальные функции конвертации, парсинга — без изменений]
-# Копируй из предыдущей версии: convert_xray_json_to_links, fetch_and_decode_configs, extract_keys, send_keys
+def extract_keys(text: str) -> list:
+    """Простая версия — только regex, без JSON парсинга"""
+    return KEY_PATTERN.findall(text)
 
 # ==================== КОМАНДЫ ====================
 
@@ -441,8 +405,6 @@ def send_welcome(message):
 
     welcome_text = (
         "Здравствуйте.\n\n"
-        "• Отправьте ссылку **happ://crypt...**, чтобы расшифровать её.\n"
-        "• Отправьте обычную ссылку (**http://...**), чтобы скачать подписку и достать VPN-ключи.\n"
         "• /addkeys — сохранить свои ключи и получить короткую ссылку.\n"
         "• /shorten — сократить любую ссылку.\n"
         "• /profile — посмотреть свои сохранённые ссылки.\n\n"
@@ -464,43 +426,54 @@ def cmd_addkeys(message):
 
     msg = bot.reply_to(
         message,
-        with_footer("Пришлите ключи, которые нужно сохранить (можно несколько, каждый с новой строки).")
+        with_footer("Пришлите ключи, которые нужно сохранить.")
     )
     bot.register_next_step_handler(msg, process_addkeys)
 
 def process_addkeys(message):
     try:
+        print(f"[DEBUG] process_addkeys called, user: {message.from_user.id}")
+        
         if not is_subscribed(message.from_user.id):
             send_subscribe_prompt(message.chat.id)
             return
 
         text = (message.text or "").strip()
-        keys = KEY_PATTERN.findall(text)  # Упрощённо, можешь вернуть extract_keys
+        print(f"[DEBUG] Raw text length: {len(text)}")
+        
+        keys = extract_keys(text)
+        print(f"[DEBUG] Extracted keys: {len(keys)}")
 
         if not keys:
             safe_reply_to(message, with_footer("Не нашёл ни одного ключа. Попробуйте ещё раз через /addkeys."))
             return
 
         content = "\n".join(keys)
+        print(f"[DEBUG] Content length: {len(content)}")
         
-        # ФИКС: Сохраняем контент во временное хранилище
+        # Сохраняем во временное хранилище
         session_id = create_pending_save(content)
+        print(f"[DEBUG] Created session: {session_id}")
         
-        # Передаём только короткий session_id (< 64 байт)
+        # Создаём кнопки с коротким session_id
         markup = telebot.types.InlineKeyboardMarkup()
         markup.row(
             telebot.types.InlineKeyboardButton("Да 🔓", callback_data=f"hwid_yes:{session_id}"),
             telebot.types.InlineKeyboardButton("Нет", callback_data=f"hwid_no:{session_id}")
         )
         
+        print(f"[DEBUG] Sending HWID choice menu")
         safe_reply_to(
             message,
             with_footer(f"Найдено ключей: {len(keys)}\n\nВключить HWID bypass для этой ссылки?"),
             reply_markup=markup
         )
+        print(f"[DEBUG] Menu sent successfully")
         
     except Exception as e:
-        print(f"[ОШИБКА в process_addkeys]: {e}")
+        print(f"[ERROR] Exception in process_addkeys: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         try:
             safe_reply_to(message, with_footer(f"Произошла ошибка: {e}"))
         except Exception:
@@ -509,42 +482,52 @@ def process_addkeys(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("hwid_"))
 def handle_hwid_choice(call):
     try:
+        print(f"[DEBUG] hwid callback triggered, data: {call.data}")
+        
         choice, session_id = call.data.split(":", 1)
         hwid_bypass = choice == "hwid_yes"
         
-        # ФИКС: Получаем контент из временного хранилища
+        print(f"[DEBUG] Choice: {choice}, Session: {session_id}, Bypass: {hwid_bypass}")
+        
+        # Получаем контент из временного хранилища
         content = get_pending_save(session_id)
         
         if not content:
+            print(f"[ERROR] Session {session_id} not found in pending_saves")
             bot.answer_callback_query(call.id, "Сессия истекла. Попробуйте ещё раз через /addkeys", show_alert=True)
             return
         
+        print(f"[DEBUG] Retrieved content length: {len(content)}")
+        
+        # Сохраняем в базу
         code = save_link('keys', content, call.from_user.id, hwid_bypass)
+        print(f"[DEBUG] Saved with code: {code}")
+        
         short_url = build_short_url(code)
         
-        response_text = f"Сохранено!\n\nОбычная ссылка:\n{short_url}"
+        response_text = f"✅ Сохранено!\n\nОбычная ссылка:\n{short_url}"
         
         if hwid_bypass:
             bypass_url = build_bypass_url(code)
             response_text += f"\n\n🔓 HWID Bypass ссылка:\n{bypass_url}\n\n⚡️ Bypass ссылка обходит блокировки по железу (работает 1 час)"
         
-        bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id, "Сохранено ✅")
         safe_send_message(call.message.chat.id, with_footer(response_text))
+        print(f"[DEBUG] Response sent successfully")
         
     except Exception as e:
-        print(f"[ОШИБКА в handle_hwid_choice]: {e}")
-        bot.answer_callback_query(call.id, "Ошибка сохранения", show_alert=True)
+        print(f"[ERROR] Exception in handle_hwid_choice: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            bot.answer_callback_query(call.id, f"Ошибка сохранения: {str(e)[:100]}", show_alert=True)
+        except Exception:
+            pass
 
 @bot.message_handler(commands=['shorten'])
 def cmd_shorten(message):
     if not is_subscribed(message.from_user.id):
         send_subscribe_prompt(message.chat.id)
-        return
-
-    parts = message.text.strip().split(maxsplit=1)
-    if len(parts) > 1 and parts[1].strip():
-        message.text = parts[1].strip()
-        process_shorten(message)
         return
 
     msg = bot.reply_to(
@@ -576,48 +559,43 @@ def process_shorten(message):
         except Exception:
             pass
 
-# [Остальные обработчики profile, view, delete, edit — копируй из предыдущей версии]
+@bot.message_handler(commands=['profile'])
+def cmd_profile(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
 
-@bot.message_handler(content_types=['text'])
-def handle_text(message):
-    try:
-        if not is_subscribed(message.from_user.id):
-            send_subscribe_prompt(message.chat.id)
-            return
+    rows = get_links_by_owner(message.from_user.id)
 
-        text = message.text.strip()
+    if not rows:
+        safe_reply_to(message, with_footer("У вас пока нет сохранённых ссылок."))
+        return
 
-        if text.startswith("happ://crypt"):
-            safe_reply_to(message, with_footer("Обрабатываю happ-ссылку..."))
-            decrypted_url = decrypt_happ_link(text)
-            if decrypted_url:
-                safe_reply_to(message, with_footer(f"Расшифровано:\n\n{decrypted_url}"))
-            else:
-                safe_reply_to(message, with_footer("Не удалось расшифровать."))
+    text = f"Ваши ссылки ({len(rows)}):\n\n"
+    for code, link_type, content, created_at, hwid_bypass in rows:
+        icon = "🔗" if link_type == 'url' else "🔑"
+        if hwid_bypass:
+            icon += "🔓"
+        short_url = build_short_url(code)
+        text += f"{icon} {short_url}\n"
 
-        elif text.startswith("http://") or text.startswith("https://"):
-            safe_reply_to(message, with_footer("Загружаю подписку..."))
-            # [fetch_and_decode_configs, extract_keys, send_keys — копируй из предыдущей версии]
-
-        else:
-            safe_reply_to(message, with_footer("Неверный формат. Используйте /addkeys или /shorten."), parse_mode="Markdown")
-
-    except Exception as e:
-        print(f"[ОШИБКА в handle_text]: {e}")
-        try:
-            safe_reply_to(message, with_footer(f"Ошибка: {e}"))
-        except Exception:
-            pass
+    safe_reply_to(message, with_footer(text))
 
 # ==================== ЗАПУСК ====================
 
 if __name__ == '__main__':
     import traceback
     try:
+        print("[START] Запуск бота...")
+        
         http_thread = threading.Thread(target=run_http_server, daemon=True)
         http_thread.start()
+        print("[START] HTTP сервер запущен")
 
         bot.remove_webhook()
+        print("[START] Webhook удалён")
+        
+        print("[START] Запуск polling...")
         bot.polling(none_stop=True)
     except Exception:
         traceback.print_exc()
