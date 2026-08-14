@@ -7,6 +7,7 @@ import sqlite3
 import string
 import random
 import threading
+import time
 
 from flask import Flask, redirect, abort, Response
 
@@ -32,6 +33,67 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, 'links.db')
 
 bot = telebot.TeleBot(TOKEN)
+
+# Увеличиваем таймауты запросов к Telegram API (по умолчанию 30с — маловато для файлов/нестабильной сети)
+telebot.apihelper.READ_TIMEOUT = 60
+telebot.apihelper.CONNECT_TIMEOUT = 60
+
+def safe_send_message(chat_id, text, retries=3, delay=2, **kwargs):
+    """Отправка сообщения с повторными попытками при сетевых таймаутах."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return safe_send_message(chat_id, text, **kwargs)
+        except requests.exceptions.ReadTimeout as e:
+            last_error = e
+            print(f"[Таймаут send_message, попытка {attempt}/{retries}]: {e}")
+            time.sleep(delay)
+        except Exception as e:
+            last_error = e
+            print(f"[Ошибка send_message]: {e}")
+            break
+    if last_error:
+        raise last_error
+
+def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
+    """Отправка документа с повторными попытками при сетевых таймаутах."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return safe_send_document(chat_id, document, **kwargs)
+        except requests.exceptions.ReadTimeout as e:
+            last_error = e
+            print(f"[Таймаут send_document, попытка {attempt}/{retries}]: {e}")
+            time.sleep(delay)
+            # Файл нужно открыть заново, если это file-объект уже был прочитан
+            if hasattr(document, 'seek'):
+                try:
+                    document.seek(0)
+                except Exception:
+                    pass
+        except Exception as e:
+            last_error = e
+            print(f"[Ошибка send_document]: {e}")
+            break
+    if last_error:
+        raise last_error
+
+def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
+    """reply_to с повторными попытками при сетевых таймаутах."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return safe_reply_to(message, text, **kwargs)
+        except requests.exceptions.ReadTimeout as e:
+            last_error = e
+            print(f"[Таймаут reply_to, попытка {attempt}/{retries}]: {e}")
+            time.sleep(delay)
+        except Exception as e:
+            last_error = e
+            print(f"[Ошибка reply_to]: {e}")
+            break
+    if last_error:
+        raise last_error
 
 # ==================== БАЗА ДАННЫХ (короткие ссылки) ====================
 
@@ -219,7 +281,7 @@ def send_keys(chat_id: int, keys: list):
         with open(file_name, 'w', encoding='utf-8') as file:
             file.write(joined)
         with open(file_name, 'rb') as file:
-            bot.send_document(
+            safe_send_document(
                 chat_id,
                 file,
                 visible_file_name=file_name,
@@ -244,12 +306,20 @@ def send_welcome(message):
         "• Команда /addkeys — чтобы сохранить свои ключи и получить короткую ссылку на них.\n"
         "• Команда /shorten — чтобы сократить любую ссылку (оригинал будет скрыт)."
     )
-    bot.reply_to(message, with_footer(welcome_text), parse_mode="Markdown")
+    safe_reply_to(message, with_footer(welcome_text), parse_mode="Markdown")
 
 @bot.message_handler(commands=['addkeys'])
 def cmd_addkeys(message):
     if not is_subscribed(message.from_user.id):
         send_subscribe_prompt(message.chat.id)
+        return
+
+    # Поддержка формата "/addkeys vless://... vmess://..." одной командой
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        arg = parts[1].strip()
+        message.text = arg
+        process_addkeys(message)
         return
 
     msg = bot.reply_to(
@@ -271,7 +341,7 @@ def process_addkeys(message):
         keys = extract_keys(text)
 
         if not keys:
-            bot.reply_to(message, with_footer(
+            safe_reply_to(message, with_footer(
                 "Не нашёл ни одного ключа в сообщении (поддерживаются vless/vmess/trojan/ss/ssr/hysteria2/tuic). "
                 "Попробуйте ещё раз через /addkeys."
             ))
@@ -281,13 +351,13 @@ def process_addkeys(message):
         code = save_link('keys', content, message.from_user.id)
         short_url = build_short_url(code)
 
-        bot.reply_to(message, with_footer(
+        safe_reply_to(message, with_footer(
             f"Сохранено ключей: {len(keys)}\n\nВаша короткая ссылка:\n{short_url}"
         ))
     except Exception as e:
         print(f"[ОШИБКА в process_addkeys]: {e}")
         try:
-            bot.reply_to(message, with_footer(f"Произошла ошибка при сохранении: {e}"))
+            safe_reply_to(message, with_footer(f"Произошла ошибка при сохранении: {e}"))
         except Exception:
             pass
 
@@ -320,7 +390,7 @@ def process_shorten(message):
         text = (message.text or "").strip()
 
         if not (text.startswith("http://") or text.startswith("https://")):
-            bot.reply_to(message, with_footer(
+            safe_reply_to(message, with_footer(
                 "Это не похоже на ссылку. Отправьте адрес, начинающийся с http:// или https://. "
                 "Попробуйте ещё раз через /shorten."
             ))
@@ -329,11 +399,11 @@ def process_shorten(message):
         code = save_link('url', text, message.from_user.id)
         short_url = build_short_url(code)
 
-        bot.reply_to(message, with_footer(f"Готово! Короткая ссылка:\n{short_url}"))
+        safe_reply_to(message, with_footer(f"Готово! Короткая ссылка:\n{short_url}"))
     except Exception as e:
         print(f"[ОШИБКА в process_shorten]: {e}")
         try:
-            bot.reply_to(message, with_footer(f"Произошла ошибка при сокращении: {e}"))
+            safe_reply_to(message, with_footer(f"Произошла ошибка при сокращении: {e}"))
         except Exception:
             pass
 
@@ -344,7 +414,7 @@ def handle_text(message):
     except Exception as e:
         print(f"[ОШИБКА в handle_text]: {e}")
         try:
-            bot.reply_to(message, with_footer(f"Произошла ошибка при обработке: {e}"))
+            safe_reply_to(message, with_footer(f"Произошла ошибка при обработке: {e}"))
         except Exception:
             pass
 
@@ -357,22 +427,22 @@ def handle_text_inner(message):
 
     # Сценарий 1: Пользователь прислал зашифрованную ссылку happ://crypt
     if text.startswith("happ://crypt"):
-        bot.reply_to(message, with_footer("Обрабатываю happ-ссылку..."))
+        safe_reply_to(message, with_footer("Обрабатываю happ-ссылку..."))
         decrypted_url = decrypt_happ_link(text)
 
         if decrypted_url:
-            bot.reply_to(message, with_footer(f"Ссылка успешно расшифрована:\n\n{decrypted_url}"))
+            safe_reply_to(message, with_footer(f"Ссылка успешно расшифрована:\n\n{decrypted_url}"))
         else:
-            bot.reply_to(message, with_footer("Не удалось расшифровать ссылку. Проверьте правильность введенных данных."))
+            safe_reply_to(message, with_footer("Не удалось расшифровать ссылку. Проверьте правильность введенных данных."))
 
     # Сценарий 2: Пользователь прислал обычную ссылку (http/https)
     elif text.startswith("http://") or text.startswith("https://"):
-        bot.reply_to(message, with_footer("Загружаю подписку по ссылке и извлекаю конфигурации..."))
+        safe_reply_to(message, with_footer("Загружаю подписку по ссылке и извлекаю конфигурации..."))
 
         configs_text = fetch_and_decode_configs(text)
 
         if configs_text.startswith("Сетевая ошибка") or configs_text.startswith("Внутренняя ошибка"):
-            bot.reply_to(message, with_footer(configs_text))
+            safe_reply_to(message, with_footer(configs_text))
             return
 
         keys = extract_keys(configs_text)
@@ -386,20 +456,20 @@ def handle_text_inner(message):
                     file.write(configs_text)
 
                 with open(file_name, 'rb') as file:
-                    bot.send_document(
+                    safe_send_document(
                         message.chat.id,
                         file,
                         visible_file_name=file_name,
                         caption=with_footer("VPN-ключи по известным схемам не найдены. Файл с сырым содержимым подписки во вложении.")
                     )
             except Exception as e:
-                bot.reply_to(message, with_footer(f"Ошибка при создании файла: {e}"))
+                safe_reply_to(message, with_footer(f"Ошибка при создании файла: {e}"))
             finally:
                 if os.path.exists(file_name):
                     os.remove(file_name)
 
     else:
-        bot.reply_to(message, with_footer(
+        safe_reply_to(message, with_footer(
             "Неверный формат. Отправьте либо ссылку **happ://crypt...**, либо обычную ссылку на подписку (**http://...**), "
             "либо используйте /addkeys или /shorten."
         ), parse_mode="Markdown")
