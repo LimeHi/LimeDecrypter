@@ -34,12 +34,10 @@ DB_PATH = os.path.join(DATA_DIR, 'links.db')
 
 bot = telebot.TeleBot(TOKEN)
 
-# Увеличиваем таймауты запросов к Telegram API (по умолчанию 30с — маловато для файлов/нестабильной сети)
 telebot.apihelper.READ_TIMEOUT = 60
 telebot.apihelper.CONNECT_TIMEOUT = 60
 
 def safe_send_message(chat_id, text, retries=3, delay=2, **kwargs):
-    """Отправка сообщения с повторными попытками при сетевых таймаутах."""
     last_error = None
     for attempt in range(1, retries + 1):
         try:
@@ -56,7 +54,6 @@ def safe_send_message(chat_id, text, retries=3, delay=2, **kwargs):
         raise last_error
 
 def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
-    """Отправка документа с повторными попытками при сетевых таймаутах."""
     last_error = None
     for attempt in range(1, retries + 1):
         try:
@@ -65,7 +62,6 @@ def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
             last_error = e
             print(f"[Таймаут send_document, попытка {attempt}/{retries}]: {e}")
             time.sleep(delay)
-            # Файл нужно открыть заново, если это file-объект уже был прочитан
             if hasattr(document, 'seek'):
                 try:
                     document.seek(0)
@@ -79,7 +75,6 @@ def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
         raise last_error
 
 def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
-    """reply_to с повторными попытками при сетевых таймаутах."""
     last_error = None
     for attempt in range(1, retries + 1):
         try:
@@ -104,7 +99,7 @@ def get_db():
     conn.execute('''
         CREATE TABLE IF NOT EXISTS links (
             code TEXT PRIMARY KEY,
-            type TEXT NOT NULL,            -- 'url' (редирект) или 'keys' (отдаём текст напрямую)
+            type TEXT NOT NULL,
             content TEXT NOT NULL,
             owner_id INTEGER,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -126,7 +121,6 @@ def generate_code(length: int = 7) -> str:
             conn.close()
 
 def save_link(link_type: str, content: str, owner_id: int) -> str:
-    """Сохраняет ссылку/ключи в базу и возвращает короткий код."""
     code = generate_code()
     with db_lock:
         conn = get_db()
@@ -150,7 +144,6 @@ def get_link(code: str):
             conn.close()
 
 def get_link_full(code: str):
-    """Возвращает (type, content, owner_id) или None."""
     with db_lock:
         conn = get_db()
         try:
@@ -160,7 +153,6 @@ def get_link_full(code: str):
             conn.close()
 
 def get_links_by_owner(owner_id: int, limit: int = 20):
-    """Возвращает список (code, type, content, created_at) для владельца, новые сначала."""
     with db_lock:
         conn = get_db()
         try:
@@ -173,7 +165,6 @@ def get_links_by_owner(owner_id: int, limit: int = 20):
             conn.close()
 
 def delete_link(code: str, owner_id: int) -> bool:
-    """Удаляет ссылку, только если она принадлежит owner_id. Возвращает True при успехе."""
     with db_lock:
         conn = get_db()
         try:
@@ -184,7 +175,6 @@ def delete_link(code: str, owner_id: int) -> bool:
             conn.close()
 
 def update_link_content(code: str, owner_id: int, new_content: str) -> bool:
-    """Обновляет содержимое ссылки, только если она принадлежит owner_id. Возвращает True при успехе."""
     with db_lock:
         conn = get_db()
         try:
@@ -217,8 +207,6 @@ def resolve_link(code):
     link_type, content = row
 
     if link_type == 'url':
-        # Не редиректим — сами скачиваем содержимое и отдаём его напрямую,
-        # чтобы оригинальный адрес нигде не светился и не было видимого перехода
         try:
             resp = requests.get(content, timeout=15)
             resp.raise_for_status()
@@ -228,7 +216,6 @@ def resolve_link(code):
             print(f"[ОШИБКА проксирования {code}]: {e}")
             abort(502)
     else:
-        # type == 'keys' — отдаём сохранённые ключи как есть, обычным текстом
         return Response(content, mimetype='text/plain')
 
 def run_http_server():
@@ -249,7 +236,6 @@ def with_footer(text: str) -> str:
     return text
 
 def is_subscribed(user_id: int) -> bool:
-    """Проверяет подписку пользователя на обязательный канал."""
     try:
         member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
         return member.status in ('member', 'administrator', 'creator')
@@ -281,23 +267,19 @@ def handle_check_sub(call):
     else:
         bot.answer_callback_query(call.id, "Подписка не найдена. Подпишись и попробуй снова.", show_alert=True)
 
-# Регулярка для всех популярных VPN-схем ссылок
 KEY_PATTERN = re.compile(
     r'(?:vless|vmess|trojan|ss|ssr|hysteria2?|hy2|tuic)://[^\s<>"]+',
     re.IGNORECASE
 )
 
 def decrypt_happ_link(encrypted_link: str) -> str:
-    """Дешифрует happ ссылку через API."""
     endpoint = "https://api.ioo.ir/v1/happ/decrypt"
     headers = {"Content-Type": "application/json"}
     payload = {"link": encrypted_link}
-
     try:
         response = requests.post(endpoint, json=payload, headers=headers, timeout=15)
         response.raise_for_status()
         data = response.json()
-
         if data.get("ok"):
             return data.get("result", "")
         return ""
@@ -306,32 +288,26 @@ def decrypt_happ_link(encrypted_link: str) -> str:
         return ""
 
 def fetch_and_decode_configs(url: str) -> str:
-    """Скачивает конфигурации по прямой ссылке и декодирует из Base64."""
     try:
         response = requests.get(url, timeout=15)
         response.raise_for_status()
         content = response.text.strip()
-
         try:
             padded_content = content + '=' * (-len(content) % 4)
             decoded_bytes = base64.b64decode(padded_content)
             return decoded_bytes.decode('utf-8')
         except Exception:
             return content
-
     except requests.exceptions.RequestException as e:
         return f"Сетевая ошибка при скачивании подписки: {e}"
     except Exception as e:
         return f"Внутренняя ошибка обработки: {e}"
 
 def extract_keys(text: str) -> list:
-    """Достаёт все vless/vmess/trojan/ss/hysteria2/tuic ключи из текста."""
     return KEY_PATTERN.findall(text)
 
 def send_keys(chat_id: int, keys: list):
-    """Отправляет найденные ключи файлом."""
     joined = "\n".join(keys)
-
     file_name = next_file_name()
     try:
         with open(file_name, 'w', encoding='utf-8') as file:
@@ -371,11 +347,9 @@ def cmd_addkeys(message):
         send_subscribe_prompt(message.chat.id)
         return
 
-    # Поддержка формата "/addkeys vless://... vmess://..." одной командой
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) > 1 and parts[1].strip():
-        arg = parts[1].strip()
-        message.text = arg
+        message.text = parts[1].strip()
         process_addkeys(message)
         return
 
@@ -424,11 +398,9 @@ def cmd_shorten(message):
         send_subscribe_prompt(message.chat.id)
         return
 
-    # Поддержка формата "/shorten https://example.com" одной командой
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) > 1 and parts[1].strip():
-        arg = parts[1].strip()
-        message.text = arg
+        message.text = parts[1].strip()
         process_shorten(message)
         return
 
@@ -464,7 +436,23 @@ def process_shorten(message):
         except Exception:
             pass
 
-# ==================== ПРОФИЛЬ: список ссылок, удаление и редактирование ====================
+# ==================== ПРОФИЛЬ: компактное меню → детали по нажатию ====================
+
+def build_profile_menu(rows: list) -> telebot.types.InlineKeyboardMarkup:
+    """
+    Строит вертикальное меню: каждая кнопка — одна ссылка.
+    Формат: «🔗 /AbCd123» или «🔑 /AbCd123»
+    """
+    markup = telebot.types.InlineKeyboardMarkup()
+    for code, link_type, content, created_at in rows:
+        icon = "🔗" if link_type == 'url' else "🔑"
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                text=f"{icon}  /{code}",
+                callback_data=f"view:{code}"
+            )
+        )
+    return markup
 
 @bot.message_handler(commands=['profile'])
 def cmd_profile(message):
@@ -480,22 +468,75 @@ def cmd_profile(message):
         ))
         return
 
-    safe_reply_to(message, with_footer(f"Ваши ссылки ({len(rows)}):"))
+    markup = build_profile_menu(rows)
+    safe_reply_to(
+        message,
+        with_footer(f"Ваши ссылки ({len(rows)}). Нажмите на любую, чтобы посмотреть детали:"),
+        reply_markup=markup
+    )
 
-    for code, link_type, content, created_at in rows:
-        short_url = build_short_url(code)
-        type_label = "🔗 Ссылка" if link_type == 'url' else "🔑 Ключи"
-        preview = content if len(content) <= 60 else content[:57] + "..."
+@bot.callback_query_handler(func=lambda call: call.data.startswith("view:"))
+def handle_view_link(call):
+    code = call.data.split(":", 1)[1]
+    row = get_link_full(code)
 
-        text = f"{type_label}\n{short_url}\n\n{preview}"
+    if not row or row[2] != call.from_user.id:
+        bot.answer_callback_query(call.id, "Ссылка не найдена или не ваша.", show_alert=True)
+        return
 
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.row(
-            telebot.types.InlineKeyboardButton("✏️ Изменить", callback_data=f"edit:{code}"),
-            telebot.types.InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{code}")
+    link_type, content, _ = row
+    short_url = build_short_url(code)
+    type_label = "🔗 Ссылка" if link_type == 'url' else "🔑 Ключи"
+    preview = content if len(content) <= 200 else content[:197] + "..."
+
+    text = f"{type_label}\n{short_url}\n\n{preview}"
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(
+        telebot.types.InlineKeyboardButton("✏️ Изменить", callback_data=f"edit:{code}"),
+        telebot.types.InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{code}")
+    )
+    markup.add(
+        telebot.types.InlineKeyboardButton("‹ Назад к списку", callback_data="profile_back")
+    )
+
+    bot.answer_callback_query(call.id)
+    try:
+        bot.edit_message_text(
+            with_footer(text),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
         )
+    except Exception:
+        safe_send_message(call.message.chat.id, with_footer(text), reply_markup=markup)
 
-        safe_send_message(message.chat.id, text, reply_markup=markup)
+@bot.callback_query_handler(func=lambda call: call.data == "profile_back")
+def handle_profile_back(call):
+    rows = get_links_by_owner(call.from_user.id)
+    bot.answer_callback_query(call.id)
+
+    if not rows:
+        try:
+            bot.edit_message_text(
+                with_footer("У вас больше нет сохранённых ссылок."),
+                call.message.chat.id,
+                call.message.message_id
+            )
+        except Exception:
+            pass
+        return
+
+    markup = build_profile_menu(rows)
+    try:
+        bot.edit_message_text(
+            with_footer(f"Ваши ссылки ({len(rows)}). Нажмите на любую, чтобы посмотреть детали:"),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    except Exception:
+        pass
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("del:"))
 def handle_delete_link(call):
@@ -504,14 +545,28 @@ def handle_delete_link(call):
 
     if success:
         bot.answer_callback_query(call.id, "Удалено ✅")
-        try:
-            bot.edit_message_text(
-                "🗑 Ссылка удалена.",
-                call.message.chat.id,
-                call.message.message_id
-            )
-        except Exception:
-            pass
+        # После удаления возвращаемся к обновлённому списку
+        rows = get_links_by_owner(call.from_user.id)
+        if not rows:
+            try:
+                bot.edit_message_text(
+                    with_footer("Ссылка удалена. Сохранённых ссылок больше нет."),
+                    call.message.chat.id,
+                    call.message.message_id
+                )
+            except Exception:
+                pass
+        else:
+            markup = build_profile_menu(rows)
+            try:
+                bot.edit_message_text(
+                    with_footer(f"Ссылка удалена. Ваши ссылки ({len(rows)}):"),
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+            except Exception:
+                pass
     else:
         bot.answer_callback_query(call.id, "Не удалось удалить (ссылка не найдена или не ваша).", show_alert=True)
 
@@ -573,6 +628,8 @@ def process_edit_link(message, code, link_type, owner_id):
         except Exception:
             pass
 
+# ==================== ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА ====================
+
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     try:
@@ -591,20 +648,16 @@ def handle_text_inner(message):
 
     text = message.text.strip()
 
-    # Сценарий 1: Пользователь прислал зашифрованную ссылку happ://crypt
     if text.startswith("happ://crypt"):
         safe_reply_to(message, with_footer("Обрабатываю happ-ссылку..."))
         decrypted_url = decrypt_happ_link(text)
-
         if decrypted_url:
             safe_reply_to(message, with_footer(f"Ссылка успешно расшифрована:\n\n{decrypted_url}"))
         else:
             safe_reply_to(message, with_footer("Не удалось расшифровать ссылку. Проверьте правильность введенных данных."))
 
-    # Сценарий 2: Пользователь прислал обычную ссылку (http/https)
     elif text.startswith("http://") or text.startswith("https://"):
         safe_reply_to(message, with_footer("Загружаю подписку по ссылке и извлекаю конфигурации..."))
-
         configs_text = fetch_and_decode_configs(text)
 
         if configs_text.startswith("Сетевая ошибка") or configs_text.startswith("Внутренняя ошибка"):
@@ -620,7 +673,6 @@ def handle_text_inner(message):
             try:
                 with open(file_name, 'w', encoding='utf-8') as file:
                     file.write(configs_text)
-
                 with open(file_name, 'rb') as file:
                     safe_send_document(
                         message.chat.id,
@@ -645,7 +697,6 @@ def handle_text_inner(message):
 if __name__ == '__main__':
     import traceback
     try:
-        # HTTP-сервер для коротких ссылок запускаем в отдельном потоке
         http_thread = threading.Thread(target=run_http_server, daemon=True)
         http_thread.start()
 
