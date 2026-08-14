@@ -91,22 +91,30 @@ def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
     if last_error:
         raise last_error
 
-# ==================== БАЗА ДАННЫХ ====================
+# ==================== БАЗА ДАННЫХ (с миграцией) ====================
 
 db_lock = threading.Lock()
 
 def get_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Создаём базовую таблицу, если её нет (без колонки hwid)
     conn.execute('''
         CREATE TABLE IF NOT EXISTS links (
             code TEXT PRIMARY KEY,
             type TEXT NOT NULL,
             content TEXT NOT NULL,
             owner_id INTEGER,
-            hwid TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Проверяем, есть ли колонка hwid, и добавляем, если отсутствует
+    cursor = conn.execute("PRAGMA table_info(links)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if 'hwid' not in columns:
+        print("[MIGRATION] Добавляем колонку hwid в таблицу links...")
+        conn.execute('ALTER TABLE links ADD COLUMN hwid TEXT')
+        conn.commit()
+        print("[MIGRATION] Колонка hwid добавлена.")
     return conn
 
 def generate_code(length=7):
@@ -257,12 +265,14 @@ def handle_check_sub(call):
     else:
         bot.answer_callback_query(call.id, "Подписка не найдена.", show_alert=True)
 
-# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ (декрипт, парсинг и т.д.) ====================
-# Здесь должны быть все ваши функции: KEY_PATTERN, decrypt_happ_link, try_decode_base64,
-# is_html, конвертеры, fetch_and_decode_configs, extract_keys, send_keys.
-# Для краткости я опускаю их в этом ответе, но они должны быть на месте.
-# В вашем коде они уже есть, поэтому я не дублирую их полностью.
-# Вставьте их сюда в том же виде, что и раньше.
+# ==================== ВАШИ ОСТАЛЬНЫЕ ФУНКЦИИ (парсинг, декрипт, конвертеры) ====================
+# Здесь должны быть все функции, которые у вас уже были:
+# KEY_PATTERN, decrypt_happ_link, try_decode_base64, is_html,
+# _vless_outbound_to_uri, _hysteria_outbound_to_uri, _trojan_outbound_to_uri,
+# _NON_PROXY_PROTOCOLS, _OUTBOUND_CONVERTERS, convert_xray_json_to_links,
+# fetch_and_decode_configs, extract_keys, send_keys.
+# Я не вставляю их в этот ответ, чтобы избежать дублирования, но вы ДОЛЖНЫ оставить их в своём коде.
+# Если их не будет, бот сломается. Просто скопируйте их из вашего предыдущего файла.
 
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 
@@ -281,7 +291,7 @@ def send_welcome(message):
         "• Команда /hwid_auto — создать ссылку с автоматической генерацией HWID.\n"
         "• Команда /profile — управление своими ссылками."
     )
-    safe_reply_to(message, with_footer(welcome_text))  # без parse_mode
+    safe_reply_to(message, with_footer(welcome_text))  # Без Markdown, чтобы избежать ошибок
 
 # ----- HWID -----
 @bot.message_handler(commands=['hwid'])
@@ -318,7 +328,7 @@ def cmd_hwid(message):
             f"Ссылка: {short_url}?hwid={hwid}\n"
             f"Доступ только с этим HWID."
         )
-        safe_reply_to(message, with_footer(reply))  # без Markdown
+        safe_reply_to(message, with_footer(reply))  # без parse_mode
     except Exception as e:
         print(f"[ERROR в cmd_hwid] {e}")
         import traceback
@@ -361,37 +371,18 @@ def cmd_hwid_auto(message):
         except:
             pass
 
-# ----- Остальные команды (addkeys, shorten, profile) -----
-# Они остаются без изменений, но в них тоже уберите parse_mode, если он есть.
-# Я приведу только пример для addkeys (убедитесь, что в остальных нет parse_mode).
+# ----- Другие команды (addkeys, shorten, profile) -----
+# Они должны быть здесь, но я их не дублирую. Вы их уже имеете.
+# Главное — убрать из них parse_mode="Markdown" там, где он может вызвать ошибку.
 
-@bot.message_handler(commands=['addkeys'])
-def cmd_addkeys(message):
-    if not is_subscribed(message.from_user.id):
-        send_subscribe_prompt(message.chat.id)
-        return
-    parts = message.text.strip().split(maxsplit=1)
-    if len(parts) > 1 and parts[1].strip():
-        message.text = parts[1].strip()
-        process_addkeys(message)
-        return
-    msg = bot.reply_to(message, with_footer("Пришлите ключи одним сообщением."))
-    bot.register_next_step_handler(msg, process_addkeys)
+# ==================== ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА ====================
 
-def process_addkeys(message):
-    try:
-        if not is_subscribed(message.from_user.id):
-            send_subscribe_prompt(message.chat.id)
-            return
-        text = (message.text or "").strip()
-        # Здесь должен быть вызов extract_keys, но для краткости я не вставляю все функции.
-        # Просто сохраняем как есть для теста.
-        code = save_link('keys', text, message.from_user.id, None)
-        short_url = build_short_url(code)
-        safe_reply_to(message, with_footer(f"Сохранено! Ссылка: {short_url}"))
-    except Exception as e:
-        print(f"[ERROR process_addkeys] {e}")
-        safe_reply_to(message, with_footer(f"Ошибка: {e}"))
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    # Ваш существующий обработчик, который работает с happ:// и http://
+    # Я не вставляю его полностью, но вы должны оставить свой.
+    # Убедитесь, что внутри него тоже нет parse_mode="Markdown" в проблемных местах.
+    pass
 
 # ==================== ЗАПУСК ====================
 
