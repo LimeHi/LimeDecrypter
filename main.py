@@ -211,26 +211,23 @@ def extract_keys(text: str) -> list:
     return KEY_PATTERN.findall(text)
 
 def send_keys(chat_id: int, keys: list):
-    """Отправляет найденные ключи: текстом, если помещается, иначе файлом."""
+    """Отправляет найденные ключи файлом."""
     joined = "\n".join(keys)
 
-    if len(joined) > 3500:
-        file_name = next_file_name()
-        try:
-            with open(file_name, 'w', encoding='utf-8') as file:
-                file.write(joined)
-            with open(file_name, 'rb') as file:
-                bot.send_document(
-                    chat_id,
-                    file,
-                    visible_file_name=file_name,
-                    caption=with_footer(f"Найдено ключей: {len(keys)}. Файл во вложении.")
-                )
-        finally:
-            if os.path.exists(file_name):
-                os.remove(file_name)
-    else:
-        bot.send_message(chat_id, with_footer(f"Найдено ключей: {len(keys)}\n\n{joined}"))
+    file_name = next_file_name()
+    try:
+        with open(file_name, 'w', encoding='utf-8') as file:
+            file.write(joined)
+        with open(file_name, 'rb') as file:
+            bot.send_document(
+                chat_id,
+                file,
+                visible_file_name=file_name,
+                caption=with_footer(f"Найдено ключей: {len(keys)}. Файл во вложении.")
+            )
+    finally:
+        if os.path.exists(file_name):
+            os.remove(file_name)
 
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 
@@ -298,6 +295,14 @@ def process_addkeys(message):
 def cmd_shorten(message):
     if not is_subscribed(message.from_user.id):
         send_subscribe_prompt(message.chat.id)
+        return
+
+    # Поддержка формата "/shorten https://example.com" одной командой
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        arg = parts[1].strip()
+        message.text = arg
+        process_shorten(message)
         return
 
     msg = bot.reply_to(
