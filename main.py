@@ -3,20 +3,121 @@ import requests
 import base64
 import os
 import re
+import sqlite3
+import string
+import random
+import threading
 
-TOKEN = os.getenv('TOKEN')                       # токен бота от @BotFather
-CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME')  # канал, подписка обязательна, формат: @название
-FOOTER_TAG = os.getenv('FOOTER_TAG', '')          # подпись под сообщениями
-FILE_PREFIX = os.getenv('FILE_PREFIX', 'keys')    # префикс имени файла с ключами
+from flask import Flask, redirect, abort, Response
+
+# ==================== КОНФИГУРАЦИЯ (переменные окружения) ====================
+
+TOKEN = os.getenv('TOKEN')                        # токен бота от @BotFather
+CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME')   # канал, подписка обязательна, формат: @название
+FOOTER_TAG = os.getenv('FOOTER_TAG', '')           # подпись под сообщениями
+FILE_PREFIX = os.getenv('FILE_PREFIX', 'keys')     # префикс имени файла с ключами
+BASE_URL = os.getenv('BASE_URL')                   # публичный домен бота, напр. https://limedecrypter.bothost.tech
+PORT = int(os.getenv('PORT', '3000'))              # порт, на котором BotHost даёт публичный доступ
+DATA_DIR = os.getenv('DATA_DIR', '/app/data')      # директория для хранения базы (постоянное хранилище)
 
 if not TOKEN:
     raise ValueError("Переменная окружения TOKEN не задана")
 if not CHANNEL_USERNAME:
     raise ValueError("Переменная окружения CHANNEL_USERNAME не задана")
+if not BASE_URL:
+    raise ValueError("Переменная окружения BASE_URL не задана (например: https://limedecrypter.bothost.tech)")
+
+BASE_URL = BASE_URL.rstrip('/')
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, 'links.db')
 
 bot = telebot.TeleBot(TOKEN)
 
-# Счётчик для нумерации файлов (@LimeVPNFREE_keys1.txt, @LimeVPNFREE_keys2.txt, ...)
+# ==================== БАЗА ДАННЫХ (короткие ссылки) ====================
+
+db_lock = threading.Lock()
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS links (
+            code TEXT PRIMARY KEY,
+            type TEXT NOT NULL,            -- 'url' (редирект) или 'keys' (отдаём текст напрямую)
+            content TEXT NOT NULL,
+            owner_id INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    return conn
+
+def generate_code(length: int = 7) -> str:
+    alphabet = string.ascii_letters + string.digits
+    with db_lock:
+        conn = get_db()
+        try:
+            while True:
+                code = ''.join(random.choices(alphabet, k=length))
+                exists = conn.execute('SELECT 1 FROM links WHERE code = ?', (code,)).fetchone()
+                if not exists:
+                    return code
+        finally:
+            conn.close()
+
+def save_link(link_type: str, content: str, owner_id: int) -> str:
+    """Сохраняет ссылку/ключи в базу и возвращает короткий код."""
+    code = generate_code()
+    with db_lock:
+        conn = get_db()
+        try:
+            conn.execute(
+                'INSERT INTO links (code, type, content, owner_id) VALUES (?, ?, ?, ?)',
+                (code, link_type, content, owner_id)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return code
+
+def get_link(code: str):
+    with db_lock:
+        conn = get_db()
+        try:
+            row = conn.execute('SELECT type, content FROM links WHERE code = ?', (code,)).fetchone()
+            return row
+        finally:
+            conn.close()
+
+def build_short_url(code: str) -> str:
+    return f"{BASE_URL}/{code}"
+
+# ==================== HTTP-СЕРВЕР (отдаёт короткие ссылки) ====================
+
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return 'OK'
+
+@app.route('/<code>')
+def resolve_link(code):
+    row = get_link(code)
+    if not row:
+        abort(404)
+
+    link_type, content = row
+
+    if link_type == 'url':
+        # Скрываем оригинальную ссылку — просто редиректим на неё
+        return redirect(content, code=302)
+    else:
+        # type == 'keys' — отдаём сохранённые ключи как есть, обычным текстом
+        return Response(content, mimetype='text/plain')
+
+def run_http_server():
+    app.run(host='0.0.0.0', port=PORT)
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БОТА ====================
+
 file_counter = 0
 
 def next_file_name() -> str:
@@ -25,7 +126,9 @@ def next_file_name() -> str:
     return f"{FILE_PREFIX}{file_counter}.txt"
 
 def with_footer(text: str) -> str:
-    return f"{text}\n\n{FOOTER_TAG}"
+    if FOOTER_TAG:
+        return f"{text}\n\n{FOOTER_TAG}"
+    return text
 
 def is_subscribed(user_id: int) -> bool:
     """Проверяет подписку пользователя на обязательный канал."""
@@ -34,7 +137,6 @@ def is_subscribed(user_id: int) -> bool:
         return member.status in ('member', 'administrator', 'creator')
     except Exception as e:
         print(f"[ОШИБКА проверки подписки]: {e}")
-        # Если не удалось проверить (бот не админ канала и т.п.) — по умолчанию не пускаем
         return False
 
 def send_subscribe_prompt(chat_id: int):
@@ -92,7 +194,6 @@ def fetch_and_decode_configs(url: str) -> str:
         response.raise_for_status()
         content = response.text.strip()
 
-        # Попытка декодирования Base64 (стандарт для подписок)
         try:
             padded_content = content + '=' * (-len(content) % 4)
             decoded_bytes = base64.b64decode(padded_content)
@@ -113,7 +214,6 @@ def send_keys(chat_id: int, keys: list):
     """Отправляет найденные ключи: текстом, если помещается, иначе файлом."""
     joined = "\n".join(keys)
 
-    # Если ключей много и текст не влезает в лимит Telegram (4096 символов) — шлём файлом
     if len(joined) > 3500:
         file_name = next_file_name()
         try:
@@ -132,6 +232,8 @@ def send_keys(chat_id: int, keys: list):
     else:
         bot.send_message(chat_id, with_footer(f"Найдено ключей: {len(keys)}\n\n{joined}"))
 
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     if not is_subscribed(message.from_user.id):
@@ -141,9 +243,56 @@ def send_welcome(message):
     welcome_text = (
         "Здравствуйте.\n\n"
         "• Отправьте ссылку **happ://crypt...**, чтобы расшифровать её в URL.\n"
-        "• Отправьте обычную ссылку (**http://...** или **https://...**), чтобы скачать подписку и достать из неё VPN-ключи (vless/vmess/trojan/ss/hysteria2/tuic)."
+        "• Отправьте обычную ссылку (**http://...** или **https://...**), чтобы скачать подписку, "
+        "достать из неё VPN-ключи и получить короткую ссылку, скрывающую оригинальный адрес.\n"
+        "• Команда /addkeys — чтобы сохранить свои ключи и получить короткую ссылку на них."
     )
     bot.reply_to(message, with_footer(welcome_text), parse_mode="Markdown")
+
+@bot.message_handler(commands=['addkeys'])
+def cmd_addkeys(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
+
+    msg = bot.reply_to(
+        message,
+        with_footer(
+            "Пришлите ключи, которые нужно сохранить (можно несколько, каждый с новой строки "
+            "или через пробел), одним сообщением."
+        )
+    )
+    bot.register_next_step_handler(msg, process_addkeys)
+
+def process_addkeys(message):
+    try:
+        if not is_subscribed(message.from_user.id):
+            send_subscribe_prompt(message.chat.id)
+            return
+
+        text = (message.text or "").strip()
+        keys = extract_keys(text)
+
+        if not keys:
+            bot.reply_to(message, with_footer(
+                "Не нашёл ни одного ключа в сообщении (поддерживаются vless/vmess/trojan/ss/ssr/hysteria2/tuic). "
+                "Попробуйте ещё раз через /addkeys."
+            ))
+            return
+
+        content = "\n".join(keys)
+        code = save_link('keys', content, message.from_user.id)
+        short_url = build_short_url(code)
+
+        bot.reply_to(message, with_footer(
+            f"Сохранено ключей: {len(keys)}\n\nВаша короткая ссылка:\n{short_url}"
+        ))
+    except Exception as e:
+        print(f"[ОШИБКА в process_addkeys]: {e}")
+        try:
+            bot.reply_to(message, with_footer(f"Произошла ошибка при сохранении: {e}"))
+        except Exception:
+            pass
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
@@ -183,12 +332,15 @@ def handle_text_inner(message):
             bot.reply_to(message, with_footer(configs_text))
             return
 
+        # Создаём короткую ссылку-редирект на оригинальный URL (сам оригинал нигде не светим)
+        code = save_link('url', text, message.from_user.id)
+        short_url = build_short_url(code)
+
         keys = extract_keys(configs_text)
 
         if keys:
             send_keys(message.chat.id, keys)
         else:
-            # Ключи не найдены — как и раньше, отдаём файлом сырой контент
             file_name = next_file_name()
             try:
                 with open(file_name, 'w', encoding='utf-8') as file:
@@ -207,12 +359,23 @@ def handle_text_inner(message):
                 if os.path.exists(file_name):
                     os.remove(file_name)
 
+        bot.send_message(message.chat.id, with_footer(f"Короткая ссылка на подписку (оригинал скрыт):\n{short_url}"))
+
     else:
-        bot.reply_to(message, with_footer("Неверный формат. Отправьте либо ссылку **happ://crypt...**, либо обычную ссылку на подписку (**http://...**)."), parse_mode="Markdown")
+        bot.reply_to(message, with_footer(
+            "Неверный формат. Отправьте либо ссылку **happ://crypt...**, либо обычную ссылку на подписку (**http://...**), "
+            "либо используйте /addkeys."
+        ), parse_mode="Markdown")
+
+# ==================== ЗАПУСК ====================
 
 if __name__ == '__main__':
     import traceback
     try:
+        # HTTP-сервер для коротких ссылок запускаем в отдельном потоке
+        http_thread = threading.Thread(target=run_http_server, daemon=True)
+        http_thread.start()
+
         bot.remove_webhook()
         bot.polling(none_stop=True)
     except Exception:
