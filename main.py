@@ -128,7 +128,6 @@ def verify_bypass_payload(payload: str) -> tuple:
         if len(parts) != 3:
             return None, False
         code, timestamp, signature = parts
-        # Проверяем подпись без учёта времени (вечный токен)
         message = f"{code}:{timestamp}:universal"
         expected_sig = hmac.new(
             BYPASS_SECRET.encode(),
@@ -164,14 +163,15 @@ def get_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Миграция для колонок, которых может не быть
     for col in ('hwid_bypass', 'hwid', 'name', 'description'):
         try:
             conn.execute(f'SELECT {col} FROM links LIMIT 1')
         except sqlite3.OperationalError:
             print(f"[MIGRATION] Добавляем колонку {col}")
-            conn.execute(f'ALTER TABLE links ADD COLUMN {col} TEXT DEFAULT NULL' if col != 'hwid_bypass' else 
-                         f'ALTER TABLE links ADD COLUMN {col} BOOLEAN DEFAULT 0')
+            if col == 'hwid_bypass':
+                conn.execute(f'ALTER TABLE links ADD COLUMN {col} BOOLEAN DEFAULT 0')
+            else:
+                conn.execute(f'ALTER TABLE links ADD COLUMN {col} TEXT DEFAULT NULL')
             conn.commit()
             print(f"[MIGRATION] Колонка {col} добавлена")
     return conn
@@ -189,7 +189,7 @@ def generate_code(length: int = 7) -> str:
         finally:
             conn.close()
 
-def save_link(link_type: str, content: str, owner_id: int, 
+def save_link(link_type: str, content: str, owner_id: int,
               hwid_bypass: bool = False, hwid: str = None,
               name: str = None, description: str = None) -> str:
     code = generate_code()
@@ -644,13 +644,16 @@ def send_welcome(message):
 
     welcome_text = (
         "Здравствуйте.\n\n"
-        "• /shorten — сократить ссылку на подписку (можно добавить название VPN и описание, а также включить HWID-защиту).\n"
-        "• /addkeys — сохранить VPN-ключи и получить короткую ссылку.\n"
-        "• /profile — посмотреть свои сохранённые ссылки."
+        "📌 Бот умеет:\n"
+        "• Автоматически расшифровывать ссылки **happ://crypt**.\n"
+        "• Автоматически загружать подписки по **http://** или **https://** ссылкам и извлекать VPN-ключи (vless, vmess, trojan, ss, hysteria и др.).\n"
+        "• /shorten — сократить ссылку на подписку с возможностью добавить название, описание и включить HWID-защиту (будет создана вечная bypass-ссылка).\n"
+        "• /addkeys — сохранить свои ключи и получить короткую ссылку.\n"
+        "• /profile — посмотреть все свои сохранённые ссылки."
     )
     safe_reply_to(message, with_footer(welcome_text))
 
-# ==================== /shorten (с запросом названия, описания и HWID) ====================
+# ==================== /shorten ====================
 
 # Словарь для хранения временных данных пользователя (url, name, description)
 user_data = {}
@@ -664,15 +667,12 @@ def cmd_shorten(message):
 
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) > 1 and parts[1].strip():
-        # Если сразу передан URL, сохраняем его и переходим к запросу имени
         url = parts[1].strip()
         if not (url.startswith("http://") or url.startswith("https://")):
             safe_reply_to(message, with_footer("Это не похоже на ссылку. Используйте /shorten <URL> или отправьте ссылку отдельно."))
             return
-        # Сохраняем URL в словарь
         with user_data_lock:
             user_data[message.from_user.id] = {'url': url}
-        # Спрашиваем название
         msg = safe_reply_to(message, with_footer("Введите название VPN (будет отображаться в профиле):"))
         bot.register_next_step_handler(msg, process_name)
         return
@@ -713,7 +713,6 @@ def process_description(message):
             return
         desc = (message.text or "").strip()
         data['description'] = desc if desc != '-' else ''
-    # Теперь спрашиваем про HWID-защиту
     markup = telebot.types.InlineKeyboardMarkup()
     markup.row(
         telebot.types.InlineKeyboardButton("Да 🔓", callback_data=f"shorten_hwid_yes:{user_id}"),
@@ -798,7 +797,6 @@ def process_addkeys(message):
             return
 
         content = "\n".join(keys)
-        # Сохраняем без HWID и без bypass
         code = save_link('keys', content, message.from_user.id, hwid_bypass=False, hwid=None, name=None, description=None)
         short_url = build_short_url(code)
         safe_reply_to(message, with_footer(f"✅ Ключи сохранены!\n\nСсылка:\n{short_url}"))
@@ -843,7 +841,7 @@ def cmd_profile(message):
 
     safe_reply_to(message, with_footer(text))
 
-# ==================== ОБРАБОТЧИК ТЕКСТА (для happ:// и обычных ссылок) ====================
+# ==================== ОБРАБОТЧИК ТЕКСТА (С АВТОМАТИЧЕСКОЙ ОБРАБОТКОЙ ССЫЛОК) ====================
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
@@ -854,6 +852,7 @@ def handle_text(message):
 
         text = message.text.strip()
 
+        # 1. happ://crypt – расшифровка
         if text.startswith("happ://crypt"):
             safe_reply_to(message, with_footer("Обрабатываю happ-ссылку..."))
             decrypted_url = decrypt_happ_link(text)
@@ -862,12 +861,39 @@ def handle_text(message):
             else:
                 safe_reply_to(message, with_footer("Не удалось расшифровать ссылку."))
 
+        # 2. Обычная HTTP/HTTPS ссылка – загружаем подписку, извлекаем ключи
         elif text.startswith("http://") or text.startswith("https://"):
-            # Если пользователь просто отправил ссылку без команды, предлагаем сократить через /shorten
-            safe_reply_to(message, with_footer("Используйте /shorten для сокращения ссылки с возможностью добавить название и защиту."))
+            safe_reply_to(message, with_footer("Загружаю подписку по ссылке и извлекаю конфигурации..."))
+            configs_text = fetch_and_decode_configs(text)
+
+            if configs_text.startswith("Сетевая ошибка") or configs_text.startswith("Внутренняя ошибка"):
+                safe_reply_to(message, with_footer(configs_text))
+                return
+
+            keys = extract_keys(configs_text)
+
+            if keys:
+                send_keys(message.chat.id, keys)
+            else:
+                file_name = next_file_name()
+                try:
+                    with open(file_name, 'w', encoding='utf-8') as file:
+                        file.write(configs_text)
+                    with open(file_name, 'rb') as file:
+                        safe_send_document(
+                            message.chat.id,
+                            file,
+                            visible_file_name=file_name,
+                            caption=with_footer("VPN-ключи не найдены. Файл с сырым содержимым подписки во вложении.")
+                        )
+                except Exception as e:
+                    safe_reply_to(message, with_footer(f"Ошибка при создании файла: {e}"))
+                finally:
+                    if os.path.exists(file_name):
+                        os.remove(file_name)
 
         else:
-            safe_reply_to(message, with_footer("Неверный формат. Используйте /shorten или /addkeys."))
+            safe_reply_to(message, with_footer("Неверный формат. Используйте /shorten, /addkeys или отправьте ссылку на подписку."))
     except Exception as e:
         print(f"[ERROR] handle_text: {e}")
         import traceback
