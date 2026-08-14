@@ -8,6 +8,8 @@ import string
 import random
 import threading
 import time
+import json
+import urllib.parse
 
 from flask import Flask, abort, Response
 
@@ -298,6 +300,174 @@ def try_decode_base64(text: str) -> str:
 def is_html(content_type: str, body: str) -> bool:
     return "text/html" in content_type or body.lstrip().startswith(("<html", "<!DOCTYPE", "<!doctype"))
 
+# ==================== КОНВЕРТЕР XRAY/V2RAY JSON -> URI-ССЫЛКИ ====================
+#
+# Некоторые подписки (в т.ч. панели, отдающие полный конфиг для приложения
+# Xray/V2Box/NekoBox) возвращают не список vless://.../vmess://... строк,
+# а один JSON-массив полных конфигов вида:
+#   [{ "inbounds": [...], "outbounds": [{ "protocol": "vless", ... }], "remarks": "..." }, ...]
+# Регулярка KEY_PATTERN такой формат не ловит, поэтому нужен отдельный разбор.
+# Служебные outbound'ы (freedom / blackhole / dns) пропускаются — это не сервера.
+
+def _vless_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
+    settings = outbound.get('settings', {}) or {}
+    stream = outbound.get('streamSettings', {}) or {}
+
+    vnext = settings.get('vnext')
+    if vnext:
+        node = vnext[0]
+        address = node.get('address')
+        port = node.get('port')
+        user = (node.get('users') or [{}])[0]
+        uid = user.get('id')
+        encryption = user.get('encryption', settings.get('encryption', 'none'))
+        flow = user.get('flow', '')
+    else:
+        address = settings.get('address')
+        port = settings.get('port')
+        uid = settings.get('id')
+        encryption = settings.get('encryption', 'none')
+        flow = settings.get('flow', '')
+
+    if not (address and port and uid):
+        return None
+
+    network = stream.get('network', 'tcp')
+    security = stream.get('security', 'none')
+
+    params = {'encryption': encryption or 'none', 'security': security, 'type': network}
+    if flow:
+        params['flow'] = flow
+
+    tls = stream.get('tlsSettings') or stream.get('realitySettings') or {}
+    if tls.get('serverName'):
+        params['sni'] = tls['serverName']
+    if tls.get('fingerprint'):
+        params['fp'] = tls['fingerprint']
+    if tls.get('alpn'):
+        params['alpn'] = ','.join(tls['alpn'])
+
+    if network == 'ws':
+        ws = stream.get('wsSettings', {}) or {}
+        if ws.get('path'):
+            params['path'] = ws['path']
+        host = (ws.get('headers') or {}).get('Host') or ws.get('host')
+        if host:
+            params['host'] = host
+    elif network == 'grpc':
+        grpc = stream.get('grpcSettings', {}) or {}
+        if grpc.get('serviceName'):
+            params['serviceName'] = grpc['serviceName']
+
+    query = urllib.parse.urlencode(params, safe=',')
+    name = urllib.parse.quote(remarks or '')
+    return f"vless://{uid}@{address}:{port}?{query}#{name}"
+
+def _hysteria_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
+    settings = outbound.get('settings', {}) or {}
+    stream = outbound.get('streamSettings', {}) or {}
+    hy = stream.get('hysteriaSettings', {}) or {}
+    tls = stream.get('tlsSettings', {}) or {}
+
+    address = settings.get('address')
+    port = settings.get('port')
+    auth = hy.get('auth')
+    version = hy.get('version') or settings.get('version') or 2
+
+    if not (address and port and auth):
+        return None
+
+    scheme = 'hysteria2' if version == 2 else 'hysteria'
+    params = {}
+    if tls.get('serverName'):
+        params['sni'] = tls['serverName']
+    if tls.get('alpn'):
+        params['alpn'] = ','.join(tls['alpn'])
+
+    query = urllib.parse.urlencode(params, safe=',')
+    name = urllib.parse.quote(remarks or '')
+    return f"{scheme}://{auth}@{address}:{port}?{query}#{name}"
+
+def _trojan_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
+    settings = outbound.get('settings', {}) or {}
+    stream = outbound.get('streamSettings', {}) or {}
+
+    servers = settings.get('servers')
+    if servers:
+        node = servers[0]
+        address = node.get('address')
+        port = node.get('port')
+        password = node.get('password')
+    else:
+        address = settings.get('address')
+        port = settings.get('port')
+        password = settings.get('password')
+
+    if not (address and port and password):
+        return None
+
+    security = stream.get('security', 'tls')
+    params = {'security': security}
+    tls = stream.get('tlsSettings', {}) or {}
+    if tls.get('serverName'):
+        params['sni'] = tls['serverName']
+
+    query = urllib.parse.urlencode(params, safe=',')
+    name = urllib.parse.quote(remarks or '')
+    return f"trojan://{password}@{address}:{port}?{query}#{name}"
+
+# Протоколы-заглушки, которые не являются реальными VPN-серверами
+_NON_PROXY_PROTOCOLS = {'freedom', 'blackhole', 'dns'}
+
+_OUTBOUND_CONVERTERS = {
+    'vless': _vless_outbound_to_uri,
+    'hysteria': _hysteria_outbound_to_uri,
+    'hysteria2': _hysteria_outbound_to_uri,
+    'trojan': _trojan_outbound_to_uri,
+}
+
+def convert_xray_json_to_links(text: str) -> list:
+    """
+    Пытается распарсить текст как JSON-конфиг(и) Xray/V2Ray (один объект
+    или список объектов с полем outbounds) и собрать из них список
+    обычных URI-ссылок (vless://, hysteria2://, trojan://...).
+    Возвращает пустой список, если это не похоже на такой JSON.
+    """
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+
+    configs = data if isinstance(data, list) else [data]
+    links = []
+
+    for cfg in configs:
+        if not isinstance(cfg, dict):
+            continue
+        outbounds = cfg.get('outbounds')
+        if not isinstance(outbounds, list):
+            continue
+
+        remarks = cfg.get('remarks', '')
+        for ob in outbounds:
+            if not isinstance(ob, dict):
+                continue
+            proto = ob.get('protocol')
+            if not proto or proto in _NON_PROXY_PROTOCOLS:
+                continue
+            converter = _OUTBOUND_CONVERTERS.get(proto)
+            if not converter:
+                continue
+            try:
+                uri = converter(ob, remarks)
+            except Exception as e:
+                print(f"[Ошибка конвертации outbound {proto}]: {e}")
+                uri = None
+            if uri:
+                links.append(uri)
+
+    return links
+
 def fetch_and_decode_configs(url: str) -> str:
     """
     Скачивает подписку. Если ответ — HTML (JS-рендер, Marzban и т.п.),
@@ -362,7 +532,11 @@ def fetch_and_decode_configs(url: str) -> str:
         return f"Внутренняя ошибка обработки: {e}"
 
 def extract_keys(text: str) -> list:
-    return KEY_PATTERN.findall(text)
+    keys = KEY_PATTERN.findall(text)
+    if keys:
+        return keys
+    # Fallback: возможно, это не список ссылок, а JSON-конфиг(и) Xray/V2Ray
+    return convert_xray_json_to_links(text)
 
 def send_keys(chat_id: int, keys: list):
     joined = "\n".join(keys)
