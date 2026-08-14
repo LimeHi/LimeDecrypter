@@ -176,14 +176,23 @@ def get_db():
         )
     ''')
     
-    # МИГРАЦИЯ: добавляем hwid_bypass если его нет
+    # МИГРАЦИЯ: добавляем hwid_bypass
     try:
         conn.execute('SELECT hwid_bypass FROM links LIMIT 1')
     except sqlite3.OperationalError:
         print("[MIGRATION] Добавляем колонку hwid_bypass")
         conn.execute('ALTER TABLE links ADD COLUMN hwid_bypass BOOLEAN DEFAULT 0')
         conn.commit()
-        print("[MIGRATION] Колонка hwid_bypass добавлена успешно")
+        print("[MIGRATION] Колонка hwid_bypass добавлена")
+    
+    # МИГРАЦИЯ: добавляем hwid
+    try:
+        conn.execute('SELECT hwid FROM links LIMIT 1')
+    except sqlite3.OperationalError:
+        print("[MIGRATION] Добавляем колонку hwid")
+        conn.execute('ALTER TABLE links ADD COLUMN hwid TEXT DEFAULT NULL')
+        conn.commit()
+        print("[MIGRATION] Колонка hwid добавлена")
     
     return conn
 
@@ -200,14 +209,14 @@ def generate_code(length: int = 7) -> str:
         finally:
             conn.close()
 
-def save_link(link_type: str, content: str, owner_id: int, hwid_bypass: bool = False) -> str:
+def save_link(link_type: str, content: str, owner_id: int, hwid_bypass: bool = False, hwid: str = None) -> str:
     code = generate_code()
     with db_lock:
         conn = get_db()
         try:
             conn.execute(
-                'INSERT INTO links (code, type, content, owner_id, hwid_bypass) VALUES (?, ?, ?, ?, ?)',
-                (code, link_type, content, owner_id, 1 if hwid_bypass else 0)
+                'INSERT INTO links (code, type, content, owner_id, hwid_bypass, hwid) VALUES (?, ?, ?, ?, ?, ?)',
+                (code, link_type, content, owner_id, 1 if hwid_bypass else 0, hwid)
             )
             conn.commit()
         finally:
@@ -218,7 +227,7 @@ def get_link(code: str):
     with db_lock:
         conn = get_db()
         try:
-            row = conn.execute('SELECT type, content, hwid_bypass FROM links WHERE code = ?', (code,)).fetchone()
+            row = conn.execute('SELECT type, content, hwid_bypass, hwid FROM links WHERE code = ?', (code,)).fetchone()
             return row
         finally:
             conn.close()
@@ -227,7 +236,7 @@ def get_link_full(code: str):
     with db_lock:
         conn = get_db()
         try:
-            row = conn.execute('SELECT type, content, owner_id, hwid_bypass FROM links WHERE code = ?', (code,)).fetchone()
+            row = conn.execute('SELECT type, content, owner_id, hwid_bypass, hwid FROM links WHERE code = ?', (code,)).fetchone()
             return row
         finally:
             conn.close()
@@ -237,7 +246,7 @@ def get_links_by_owner(owner_id: int, limit: int = 20):
         conn = get_db()
         try:
             rows = conn.execute(
-                'SELECT code, type, content, created_at, hwid_bypass FROM links WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
+                'SELECT code, type, content, created_at, hwid_bypass, hwid FROM links WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
                 (owner_id, limit)
             ).fetchall()
             return rows
@@ -284,7 +293,13 @@ def resolve_link(code):
     if not row:
         abort(404)
 
-    link_type, content, hwid_bypass = row
+    link_type, content, hwid_bypass, hwid = row
+
+    # Проверяем HWID, если он задан
+    if hwid:
+        request_hwid = request.args.get('hwid') or request.args.get('payload')
+        if not request_hwid or request_hwid != hwid:
+            abort(403, "HWID required or mismatch")
 
     if link_type == 'url':
         try:
@@ -314,11 +329,12 @@ def bypass_hwid_link(code):
     if not row:
         abort(404)
     
-    link_type, content, hwid_bypass = row
+    link_type, content, hwid_bypass, hwid = row
     
     if not hwid_bypass:
         abort(403, "HWID bypass not enabled for this link")
     
+    # bypass-ссылка игнорирует проверку hwid, отдаём содержимое
     headers = {
         'X-HWID-Bypass': 'enabled',
         'X-Bypass-Token': payload
@@ -707,7 +723,8 @@ def process_addkeys(message):
         
         safe_reply_to(
             message,
-            with_footer(f"Найдено ключей: {len(keys)}\n\nВключить HWID bypass для этой ссылки?"),
+            with_footer(f"Найдено ключей: {len(keys)}\n\nВключить HWID-защиту и bypass для этой ссылки?\n"
+                        f"(При выборе 'Да' ссылка будет привязана к вашему Telegram ID, но будет сгенерирована временная bypass-ссылка)"),
             reply_markup=markup
         )
         
@@ -732,14 +749,25 @@ def handle_hwid_choice(call):
             bot.answer_callback_query(call.id, "Сессия истекла. Попробуйте ещё раз через /addkeys", show_alert=True)
             return
         
-        code = save_link('keys', content, call.from_user.id, hwid_bypass)
+        # Если выбран bypass, генерируем HWID на основе Telegram ID
+        if hwid_bypass:
+            hwid = f"tg_{call.from_user.id}"
+        else:
+            hwid = None
+        
+        code = save_link('keys', content, call.from_user.id, hwid_bypass, hwid)
         short_url = build_short_url(code)
         
         response_text = f"✅ Сохранено!\n\nОбычная ссылка:\n{short_url}"
         
+        if hwid:
+            response_text += f"\n\n⚠️ Для доступа по обычной ссылке нужен HWID: `{hwid}`\n"
+            response_text += f"Добавьте параметр: `?hwid={hwid}`"
+        
         if hwid_bypass:
             bypass_url = build_bypass_url(code)
-            response_text += f"\n\n🔓 HWID Bypass ссылка:\n{bypass_url}\n\n⚡️ Bypass ссылка обходит блокировки по железу (работает 1 час)"
+            response_text += f"\n\n🔓 **HWID Bypass ссылка** (действует 1 час):\n{bypass_url}\n"
+            response_text += "По ней можно получить ключи без указания HWID."
         
         bot.answer_callback_query(call.id, "Сохранено ✅")
         safe_send_message(call.message.chat.id, with_footer(response_text))
@@ -783,7 +811,7 @@ def process_shorten(message):
             safe_reply_to(message, with_footer("Это не похоже на ссылку. Попробуйте ещё раз через /shorten."))
             return
 
-        code = save_link('url', text, message.from_user.id, hwid_bypass=False)
+        code = save_link('url', text, message.from_user.id, hwid_bypass=False, hwid=None)
         short_url = build_short_url(code)
 
         safe_reply_to(message, with_footer(f"Готово! Короткая ссылка:\n{short_url}"))
@@ -807,12 +835,17 @@ def cmd_profile(message):
         return
 
     text = f"Ваши ссылки ({len(rows)}):\n\n"
-    for code, link_type, content, created_at, hwid_bypass in rows:
+    for code, link_type, content, created_at, hwid_bypass, hwid in rows:
         icon = "🔗" if link_type == 'url' else "🔑"
+        if hwid:
+            icon += "🔒"  # защищена HWID
         if hwid_bypass:
-            icon += "🔓"
+            icon += "🔓"  # есть bypass
         short_url = build_short_url(code)
-        text += f"{icon} {short_url}\n"
+        text += f"{icon} {short_url}"
+        if hwid:
+            text += f" (HWID: {hwid})"
+        text += "\n"
 
     safe_reply_to(message, with_footer(text))
 
