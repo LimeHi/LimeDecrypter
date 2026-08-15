@@ -277,6 +277,10 @@ def resolve_link(code):
         # Живём заново каждый раз: имитируем Happ-клиент с нужным HWID.
         try:
             configs_text = fetch_and_decode_configs(content, device_id=device_id)
+            if configs_text.startswith("UPSTREAM_UNREACHABLE:"):
+                # Хост апстрима не отвечает на уровне сети — отдаём явную
+                # ошибку сразу, а не молчим и не притворяемся 200.
+                return Response(configs_text, status=502, mimetype='text/plain; charset=utf-8')
             keys = extract_keys(configs_text)
             if keys:
                 body = "\n".join(keys)
@@ -533,6 +537,14 @@ def _happ_headers(device_id: str = None) -> dict:
         "Cache-Control": "no-cache",
     }
 
+class UpstreamUnreachable(Exception):
+    """Апстрим-хост не отвечает на уровне TCP/DNS (не HTTP-ошибка).
+    В этом случае нет смысла перебирать другие пути/форматы на том же хосте —
+    это, скорее всего, бан IP-диапазона Railway/датацентра со стороны продавца
+    подписки, а не проблема заголовков/HWID."""
+    pass
+
+
 def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
     """
     Эмулирует запрос от Happ/<version>/Android/<device_id>.
@@ -541,7 +553,10 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
     скачивании конфигурации, и никак не связано с ключами, которые
     сохраняются через /addkeys.
     Пробует разные комбинации заголовков и параметров, чтобы получить
-    реальные конфигурации.
+    реальные конфигурации. Если хост недоступен на сетевом уровне —
+    сразу останавливается вместо перебора всех вариантов (иначе это
+    занимает больше минуты и клиент отваливается по таймауту раньше,
+    чем мы успеваем ответить).
     """
 
     def fetch_with_headers(u, headers=None):
@@ -549,7 +564,10 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
             headers = _happ_headers(device_id)
         session = requests.Session()
         session.headers.update(headers)
-        resp = session.get(u, timeout=15, stream=True)
+        try:
+            resp = session.get(u, timeout=(6, 15), stream=True)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            raise UpstreamUnreachable(str(e)) from e
         resp.raise_for_status()
         if resp.headers.get('Content-Encoding') == 'gzip':
             try:
@@ -575,6 +593,9 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
                 ct2 = resp2.headers.get('Content-Type', '')
                 if not is_html(ct2, body2) and body2:
                     return try_decode_base64(body2)
+    except UpstreamUnreachable as e:
+        print(f"[Шаг 1] апстрим недоступен: {e}")
+        return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает (сетевой таймаут). Похоже, хост блокирует IP сервера."
     except Exception as e:
         print(f"[Шаг 1] ошибка: {e}")
 
@@ -586,6 +607,9 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
         ct = resp.headers.get('Content-Type', '')
         if not is_html(ct, body) and body:
             return try_decode_base64(body)
+    except UpstreamUnreachable as e:
+        print(f"[Шаг 2] апстрим недоступен: {e}")
+        return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает (сетевой таймаут). Похоже, хост блокирует IP сервера."
     except Exception as e:
         print(f"[Шаг 2] ошибка: {e}")
 
@@ -611,6 +635,9 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
             ct = resp.headers.get('Content-Type', '')
             if not is_html(ct, body) and body:
                 return try_decode_base64(body)
+        except UpstreamUnreachable as e:
+            print(f"[Альтернатива {alt_url}] апстрим недоступен: {e}")
+            return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает (сетевой таймаут). Похоже, хост блокирует IP сервера."
         except Exception as e:
             print(f"[Альтернатива {alt_url}] ошибка: {e}")
 
