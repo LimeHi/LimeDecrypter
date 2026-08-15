@@ -79,7 +79,7 @@ def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
             print(f"[Ошибка reply_to]: {e}")
             raise
 
-# ==================== БАЗА ДАННЫХ (с поддержкой HWID для подписок) ====================
+# ==================== БАЗА ДАННЫХ ====================
 
 db_lock = threading.Lock()
 
@@ -96,7 +96,6 @@ def get_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Если столбец hwid отсутствует (при обновлении старой базы), добавляем его
     try:
         conn.execute('ALTER TABLE links ADD COLUMN hwid TEXT DEFAULT NULL')
     except sqlite3.OperationalError:
@@ -212,7 +211,7 @@ def send_subscribe_prompt(chat_id: int):
 def handle_check_sub(call):
     if is_subscribed(call.from_user.id):
         bot.answer_callback_query(call.id, "Подписка подтверждена ✅")
-        safe_send_message(call.message.chat.id, with_footer("Отлично! Теперь можешь пользоваться ботом."))
+        safe_send_message(call.message.chat.id, with_footer("Отлично! Теперь вы можете пользоваться ботом."))
     else:
         bot.answer_callback_query(call.id, "Подписка не найдена.", show_alert=True)
 
@@ -246,8 +245,8 @@ def try_decode_base64(text: str) -> str:
 def is_html(content_type: str, body: str) -> bool:
     return "text/html" in content_type or body.lstrip().startswith(("<html", "<!DOCTYPE", "<!doctype"))
 
-# ==================== КОНВЕРТЕР JSON -> URI (сокращено для примера, полная версия из вашего кода) ====================
-# Здесь сохранен весь ваш функционал конвертации
+# ==================== КОНВЕРТЕР JSON -> URI ====================
+
 def _vless_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
     settings = outbound.get('settings', {}) or {}
     stream = outbound.get('streamSettings', {}) or {}
@@ -408,10 +407,6 @@ def extract_keys(text: str) -> list:
 # ==================== ЭМУЛЯЦИЯ HAPP ====================
 
 def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
-    """
-    Эмулирует запрос от Happ. 
-    Использует переданный hwid для User-Agent (обход защиты подписок).
-    """
     actual_hwid = hwid if hwid else str(random.randint(100000000000000000, 999999999999999999))
     
     HAPP_HEADERS = {
@@ -428,7 +423,8 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
             headers = HAPP_HEADERS.copy()
         session = requests.Session()
         session.headers.update(headers)
-        resp = session.get(u, timeout=15, stream=True)
+        # Таймаут снижен до 5 секунд для ускорения отбраковки мертвых ссылок
+        resp = session.get(u, timeout=5, stream=True)
         resp.raise_for_status()
         
         if resp.headers.get('Content-Encoding') == 'gzip':
@@ -441,6 +437,7 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
             content = resp.text
         return resp, content
 
+    # Шаг 1: Обычный запрос
     try:
         resp, body = fetch_with_headers(url)
         ct = resp.headers.get('Content-Type', '')
@@ -455,9 +452,10 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
                 ct2 = resp2.headers.get('Content-Type', '')
                 if not is_html(ct2, body2) and body2:
                     return try_decode_base64(body2)
-    except Exception as e:
-        print(f"[Шаг 1] ошибка: {e}")
+    except Exception:
+        pass
 
+    # Шаг 2: Запрос с Accept: application/json
     try:
         headers_json = HAPP_HEADERS.copy()
         headers_json["Accept"] = "application/json"
@@ -465,9 +463,10 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
         ct = resp.headers.get('Content-Type', '')
         if not is_html(ct, body) and body:
             return try_decode_base64(body)
-    except Exception as e:
-        print(f"[Шаг 2] ошибка: {e}")
+    except Exception:
+        pass
 
+    # Шаг 3: Перебор альтернативных путей
     base = url.rstrip("/")
     token = base.split("/")[-1] if "/sub/" not in base else ""
     origin = "/".join(base.split("/")[:-1]) if "/sub/" not in base else base
@@ -477,29 +476,25 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
         candidates.append(f"{origin}/sub/{token}")
     candidates.append(f"{base}/sub")
     candidates.append(f"{base}?format=clash")
-    candidates.append(f"{base}?app=happ")
     
-    if "?" in base:
-        candidates.append(f"{base}&format=clash")
-        candidates.append(f"{base}&app=happ")
-    else:
-        candidates.append(f"{base}?format=clash")
-        candidates.append(f"{base}?app=happ")
-
     for alt_url in candidates:
         try:
             resp, body = fetch_with_headers(alt_url)
             ct = resp.headers.get('Content-Type', '')
             if not is_html(ct, body) and body:
                 return try_decode_base64(body)
-        except Exception as e:
-            print(f"[Альтернатива {alt_url}] ошибка: {e}")
+        except Exception:
+            continue
 
     return body if 'body' in locals() else "Не удалось получить подписку"
 
 # ==================== HTTP-СЕРВЕР (Динамический прокси) ====================
 
 app = Flask(__name__)
+
+# Словарь для кэширования: {code: (timestamp, base64_data)}
+subscription_cache = {}
+CACHE_TTL = 300 # Кэш хранится 5 минут (300 секунд)
 
 @app.route('/')
 def health_check():
@@ -514,16 +509,24 @@ def resolve_link(code):
     link_type, content, owner_id, name, hwid = row
 
     if link_type == 'url':
+        # Проверка наличия свежего кэша
+        if code in subscription_cache:
+            cached_time, cached_data = subscription_cache[code]
+            if time.time() - cached_time < CACHE_TTL:
+                return Response(cached_data, mimetype='text/plain')
+
+        # Если кэша нет или он устарел, собираем подписку заново
         try:
-            # ДИНАМИЧЕСКИЙ ПРОКСИ: При каждом запросе сервер скачивает конфиги,
-            # парсит их (эмулируя Happ) и отдает чисто в виде стандартной подписки.
             configs_text = fetch_and_decode_configs(content, hwid)
             keys = extract_keys(configs_text)
             
             if keys:
-                # Пакуем список ключей в Base64 для максимальной совместимости с клиентами
                 joined_keys = "\n".join(keys)
                 encoded_sub = base64.b64encode(joined_keys.encode('utf-8')).decode('utf-8')
+                
+                # Сохраняем успешный результат в кэш
+                subscription_cache[code] = (time.time(), encoded_sub)
+                
                 return Response(encoded_sub, mimetype='text/plain')
             else:
                 return Response("Ошибка: ключи не найдены или сервер источника не ответил", status=404)
@@ -531,13 +534,13 @@ def resolve_link(code):
             print(f"[ОШИБКА проксирования {code}]: {e}")
             abort(502)
     else:
-        # Для статических ключей (link_type == 'keys')
-        # Отдаем их тоже в виде классической Base64 подписки
+        # Для статических ключей кэширование не требуется
         encoded_sub = base64.b64encode(content.encode('utf-8')).decode('utf-8')
         return Response(encoded_sub, mimetype='text/plain')
 
 def run_http_server():
-    app.run(host='0.0.0.0', port=PORT)
+    # threaded=True позволяет обрабатывать запросы асинхронно
+    app.run(host='0.0.0.0', port=PORT, threaded=True)
 
 # ==================== КОМАНДЫ ====================
 
@@ -558,7 +561,7 @@ def send_welcome(message):
     )
     safe_reply_to(message, with_footer(welcome_text))
 
-# ==================== /shorten (Создание прокси-подписки с HWID) ====================
+# ==================== /shorten ====================
 
 user_data = {}
 user_data_lock = threading.Lock()
@@ -631,7 +634,7 @@ def process_hwid(message):
     response_text = f"✅ Динамическая прокси-подписка создана!\n\n📌 Название: {name}\n🆔 HWID: {hwid}\n🔗 {short_url}\n\nТеперь эта ссылка будет автоматически перехватывать и обновлять ключи из оригинала при каждом обновлении в клиенте."
     safe_reply_to(message, with_footer(response_text))
 
-# ==================== /addkeys (Статические ключи без HWID) ====================
+# ==================== /addkeys ====================
 
 @bot.message_handler(commands=['addkeys'])
 def cmd_addkeys(message):
