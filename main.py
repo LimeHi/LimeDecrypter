@@ -52,7 +52,8 @@ def safe_send_message(chat_id, text, retries=3, delay=2, **kwargs):
             time.sleep(delay)
         except Exception as e:
             print(f"[Ошибка send_message]: {e}")
-            raise
+            if attempt == retries:
+                raise
 
 def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
     for attempt in range(1, retries + 1):
@@ -67,7 +68,8 @@ def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
                     pass
         except Exception as e:
             print(f"[Ошибка send_document]: {e}")
-            raise
+            if attempt == retries:
+                raise
 
 def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
     for attempt in range(1, retries + 1):
@@ -77,7 +79,8 @@ def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
             time.sleep(delay)
         except Exception as e:
             print(f"[Ошибка reply_to]: {e}")
-            raise
+            if attempt == retries:
+                raise
 
 # ==================== БАЗА ДАННЫХ ====================
 
@@ -423,7 +426,7 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
             headers = HAPP_HEADERS.copy()
         session = requests.Session()
         session.headers.update(headers)
-        # Таймаут снижен до 5 секунд для ускорения отбраковки мертвых ссылок
+        # Таймаут снижен до 5 секунд
         resp = session.get(u, timeout=5, stream=True)
         resp.raise_for_status()
         
@@ -437,7 +440,6 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
             content = resp.text
         return resp, content
 
-    # Шаг 1: Обычный запрос
     try:
         resp, body = fetch_with_headers(url)
         ct = resp.headers.get('Content-Type', '')
@@ -455,7 +457,6 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
     except Exception:
         pass
 
-    # Шаг 2: Запрос с Accept: application/json
     try:
         headers_json = HAPP_HEADERS.copy()
         headers_json["Accept"] = "application/json"
@@ -466,7 +467,6 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
     except Exception:
         pass
 
-    # Шаг 3: Перебор альтернативных путей
     base = url.rstrip("/")
     token = base.split("/")[-1] if "/sub/" not in base else ""
     origin = "/".join(base.split("/")[:-1]) if "/sub/" not in base else base
@@ -492,9 +492,8 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
 
 app = Flask(__name__)
 
-# Словарь для кэширования: {code: (timestamp, base64_data)}
 subscription_cache = {}
-CACHE_TTL = 300 # Кэш хранится 5 минут (300 секунд)
+CACHE_TTL = 300 
 
 @app.route('/')
 def health_check():
@@ -509,13 +508,11 @@ def resolve_link(code):
     link_type, content, owner_id, name, hwid = row
 
     if link_type == 'url':
-        # Проверка наличия свежего кэша
         if code in subscription_cache:
             cached_time, cached_data = subscription_cache[code]
             if time.time() - cached_time < CACHE_TTL:
                 return Response(cached_data, mimetype='text/plain')
 
-        # Если кэша нет или он устарел, собираем подписку заново
         try:
             configs_text = fetch_and_decode_configs(content, hwid)
             keys = extract_keys(configs_text)
@@ -524,9 +521,7 @@ def resolve_link(code):
                 joined_keys = "\n".join(keys)
                 encoded_sub = base64.b64encode(joined_keys.encode('utf-8')).decode('utf-8')
                 
-                # Сохраняем успешный результат в кэш
                 subscription_cache[code] = (time.time(), encoded_sub)
-                
                 return Response(encoded_sub, mimetype='text/plain')
             else:
                 return Response("Ошибка: ключи не найдены или сервер источника не ответил", status=404)
@@ -534,40 +529,37 @@ def resolve_link(code):
             print(f"[ОШИБКА проксирования {code}]: {e}")
             abort(502)
     else:
-        # Для статических ключей кэширование не требуется
         encoded_sub = base64.b64encode(content.encode('utf-8')).decode('utf-8')
         return Response(encoded_sub, mimetype='text/plain')
 
 def run_http_server():
-    # threaded=True позволяет обрабатывать запросы асинхронно
-    app.run(host='0.0.0.0', port=PORT, threaded=True)
+    # use_reloader=False предотвращает блокировку потока Flask'ом
+    app.run(host='0.0.0.0', port=PORT, threaded=True, use_reloader=False)
 
-# ==================== КОМАНДЫ ====================
+# ==================== КОМАНДЫ БОТА ====================
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
+    print(f"[LOG] Получена команда /start от {message.from_user.id}")
     if not is_subscribed(message.from_user.id):
         send_subscribe_prompt(message.chat.id)
         return
 
+    # Заменил символы ** на <b>, чтобы избежать ошибок парсинга Markdown в клиентах
     welcome_text = (
         "Здравствуйте.\n\n"
-        "📌 Бот умеет:\n"
-        "• Автоматически расшифровывать ссылки **happ://crypt**.\n"
-        "• Извлекать VPN-ключи по **http/https** ссылкам (работает как настоящий клиент Happ).\n"
+        "📌 <b>Бот умеет:</b>\n"
+        "• Автоматически расшифровывать ссылки <b>happ://crypt</b>.\n"
+        "• Извлекать VPN-ключи по <b>http/https</b> ссылкам (работает как настоящий клиент Happ).\n"
         "• /shorten — создать динамическую прокси-подписку (с возможностью задать HWID для обхода).\n"
         "• /addkeys — сохранить свои ключи и получить короткую ссылку-подписку.\n"
         "• /profile — управлять сохранёнными подписками."
     )
-    safe_reply_to(message, with_footer(welcome_text))
-
-# ==================== /shorten ====================
-
-user_data = {}
-user_data_lock = threading.Lock()
+    safe_reply_to(message, with_footer(welcome_text), parse_mode="HTML")
 
 @bot.message_handler(commands=['shorten'])
 def cmd_shorten(message):
+    print(f"[LOG] Получена команда /shorten от {message.from_user.id}")
     if not is_subscribed(message.from_user.id):
         send_subscribe_prompt(message.chat.id)
         return
@@ -631,13 +623,12 @@ def process_hwid(message):
 
     code = save_link('url', url, user_id, name, hwid)
     short_url = build_short_url(code)
-    response_text = f"✅ Динамическая прокси-подписка создана!\n\n📌 Название: {name}\n🆔 HWID: {hwid}\n🔗 {short_url}\n\nТеперь эта ссылка будет автоматически перехватывать и обновлять ключи из оригинала при каждом обновлении в клиенте."
-    safe_reply_to(message, with_footer(response_text))
-
-# ==================== /addkeys ====================
+    response_text = f"✅ <b>Динамическая прокси-подписка создана!</b>\n\n📌 Название: {name}\n🆔 HWID: {hwid}\n🔗 {short_url}\n\nТеперь эта ссылка будет автоматически перехватывать и обновлять ключи из оригинала при каждом обновлении в клиенте."
+    safe_reply_to(message, with_footer(response_text), parse_mode="HTML")
 
 @bot.message_handler(commands=['addkeys'])
 def cmd_addkeys(message):
+    print(f"[LOG] Получена команда /addkeys от {message.from_user.id}")
     if not is_subscribed(message.from_user.id):
         send_subscribe_prompt(message.chat.id)
         return
@@ -674,24 +665,9 @@ def process_addkeys(message):
     except Exception as e:
         safe_reply_to(message, with_footer(f"Ошибка: {e}"))
 
-# ==================== ПРОФИЛЬ ====================
-
-def build_profile_menu(rows: list) -> telebot.types.InlineKeyboardMarkup:
-    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
-    for row in rows:
-        code, link_type, content, created_at, name, hwid = row
-        icon = "🔄" if link_type == 'url' else "🔑"
-        display_name = name if name else code
-        markup.add(
-            telebot.types.InlineKeyboardButton(
-                text=f"{icon} {display_name}",
-                callback_data=f"view:{code}"
-            )
-        )
-    return markup
-
 @bot.message_handler(commands=['profile'])
 def cmd_profile(message):
+    print(f"[LOG] Получена команда /profile от {message.from_user.id}")
     if not is_subscribed(message.from_user.id):
         send_subscribe_prompt(message.chat.id)
         return
@@ -709,6 +685,20 @@ def cmd_profile(message):
         reply_markup=markup
     )
 
+def build_profile_menu(rows: list) -> telebot.types.InlineKeyboardMarkup:
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    for row in rows:
+        code, link_type, content, created_at, name, hwid = row
+        icon = "🔄" if link_type == 'url' else "🔑"
+        display_name = name if name else code
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                text=f"{icon} {display_name}",
+                callback_data=f"view:{code}"
+            )
+        )
+    return markup
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view:"))
 def handle_view_link(call):
     code = call.data.split(":", 1)[1]
@@ -724,7 +714,7 @@ def handle_view_link(call):
     preview = content if len(content) <= 200 else content[:197] + "..."
 
     hwid_text = f"\n🆔 HWID: {hwid}" if link_type == 'url' and hwid else ""
-    text = f"{type_label}\n\n📌 Название: {name or '—'}{hwid_text}\n🔗 {short_url}\n\n📄 Источник / Содержимое:\n{preview}"
+    text = f"<b>{type_label}</b>\n\n📌 Название: {name or '—'}{hwid_text}\n🔗 {short_url}\n\n📄 <b>Источник / Содержимое:</b>\n{preview}"
 
     markup = telebot.types.InlineKeyboardMarkup()
     markup.row(
@@ -741,10 +731,11 @@ def handle_view_link(call):
             with_footer(text),
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=markup
+            reply_markup=markup,
+            parse_mode="HTML"
         )
     except Exception:
-        safe_send_message(call.message.chat.id, with_footer(text), reply_markup=markup)
+        safe_send_message(call.message.chat.id, with_footer(text), reply_markup=markup, parse_mode="HTML")
 
 @bot.callback_query_handler(func=lambda call: call.data == "profile_back")
 def handle_profile_back(call):
@@ -826,6 +817,7 @@ def send_keys(chat_id: int, keys: list):
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
+    print(f"[LOG] Получен текст от {message.from_user.id}: {message.text[:20]}...")
     try:
         if not is_subscribed(message.from_user.id):
             send_subscribe_prompt(message.chat.id)
@@ -843,7 +835,6 @@ def handle_text(message):
 
         elif text.startswith("http://") or text.startswith("https://"):
             safe_reply_to(message, with_footer("Загружаю подписку как клиент Happ (для проверки/извлечения)..."))
-            # Используем случайный HWID просто для проверки (это не сохраняет подписку)
             configs_text = fetch_and_decode_configs(text)
 
             if configs_text.startswith("Сетевая ошибка") or configs_text.startswith("Внутренняя ошибка") or not configs_text:
@@ -886,13 +877,20 @@ if __name__ == '__main__':
         conn = get_db()
         conn.close()
         print("[START] База данных инициализирована")
+        
         http_thread = threading.Thread(target=run_http_server, daemon=True)
         http_thread.start()
         print("[START] HTTP сервер запущен")
-        bot.remove_webhook()
-        print("[START] Webhook удалён")
+        
+        try:
+            bot.remove_webhook()
+            print("[START] Webhook удалён")
+        except Exception as e:
+            print(f"[START] Внимание (удаление вебхука): {e}. Продолжаю запуск...")
+            
         print("[START] Запуск polling...")
-        bot.polling(none_stop=True)
+        # Установил robust loop для polling'a, чтобы не падал
+        bot.infinity_polling(timeout=60, logger_level=None)
     except Exception:
         traceback.print_exc()
     finally:
