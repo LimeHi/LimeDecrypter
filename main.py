@@ -15,6 +15,8 @@ import hmac
 import uuid
 import gzip
 import io
+import sys  # ← ДОБАВИЛИ
+import traceback  # ← ДОБАВИЛИ
 
 from flask import Flask, abort, Response, request
 
@@ -28,10 +30,6 @@ BASE_URL = os.getenv('BASE_URL')
 PORT = int(os.getenv('PORT', '3000'))
 DATA_DIR = os.getenv('DATA_DIR', '/app/data')
 
-# HWID (device id), который бот подставляет в User-Agent при обращении
-# к исходному серверу подписки, имитируя реальный клиент Happ.
-# Это НЕ HWID для привязки клиента — используется только для скачивания
-# конфигурации с апстрим-сервера подписки.
 DEFAULT_DEVICE_ID = os.getenv('DEFAULT_DEVICE_ID', '178394521473618780')
 HAPP_VERSION = os.getenv('HAPP_VERSION', '3.26.3')
 
@@ -46,12 +44,28 @@ BASE_URL = BASE_URL.rstrip('/')
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, 'links.db')
 
-bot = telebot.TeleBot(TOKEN)
+print(f"[CONFIG] DATA_DIR: {DATA_DIR}")
+print(f"[CONFIG] DB_PATH: {DB_PATH}")
 
+bot = telebot.TeleBot(TOKEN)
 telebot.apihelper.READ_TIMEOUT = 60
 telebot.apihelper.CONNECT_TIMEOUT = 60
 
-# ==================== ВРЕМЕННОЕ ХРАНИЛИЩЕ (для команд) ====================
+# ==================== ЛОГИРОВАНИЕ ====================
+
+def log_error(tag: str, msg: str, exc=None):
+    """Логирует ошибку в stderr"""
+    if exc:
+        print(f"[ERROR] {tag}: {msg}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+    else:
+        print(f"[ERROR] {tag}: {msg}", file=sys.stderr)
+
+def log_info(tag: str, msg: str):
+    """Логирует информацию в stdout"""
+    print(f"[INFO] {tag}: {msg}")
+
+# ==================== ВРЕМЕННОЕ ХРАНИЛИЩЕ ====================
 
 pending_saves = {}
 pending_saves_lock = threading.Lock()
@@ -85,8 +99,9 @@ def safe_send_message(chat_id, text, retries=3, delay=2, **kwargs):
         except requests.exceptions.ReadTimeout as e:
             time.sleep(delay)
         except Exception as e:
-            print(f"[Ошибка send_message]: {e}")
-            raise
+            log_error("send_message", f"attempt {attempt}: {e}", e)
+            if attempt == retries:
+                raise
 
 def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
     for attempt in range(1, retries + 1):
@@ -100,8 +115,9 @@ def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
                 except Exception:
                     pass
         except Exception as e:
-            print(f"[Ошибка send_document]: {e}")
-            raise
+            log_error("send_document", f"attempt {attempt}: {e}", e)
+            if attempt == retries:
+                raise
 
 def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
     for attempt in range(1, retries + 1):
@@ -110,14 +126,11 @@ def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
         except requests.exceptions.ReadTimeout as e:
             time.sleep(delay)
         except Exception as e:
-            print(f"[Ошибка reply_to]: {e}")
-            raise
+            log_error("reply_to", f"attempt {attempt}: {e}", e)
+            if attempt == retries:
+                raise
 
 # ==================== БАЗА ДАННЫХ ====================
-# ВАЖНО: колонка device_id используется ТОЛЬКО для ссылок типа 'url'
-# (то есть для подписок, которые бот сам ходит и забирает у апстрима).
-# Для type='keys' (просто вставленные vless/vmess/trojan/... ключи)
-# device_id никогда не используется и не запрашивается.
 
 db_lock = threading.Lock()
 
@@ -134,7 +147,6 @@ def get_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Добавляем device_id, если база создана старой версией скрипта
     try:
         conn.execute('SELECT device_id FROM links LIMIT 1')
     except Exception:
@@ -142,7 +154,6 @@ def get_db():
             conn.execute('ALTER TABLE links ADD COLUMN device_id TEXT DEFAULT NULL')
         except Exception:
             pass
-    # На всякий случай подчищаем старые HWID-колонки клиента (если остались от прошлых версий)
     for legacy_col in ('hwid', 'hwid_bypass'):
         try:
             conn.execute(f'SELECT {legacy_col} FROM links LIMIT 1')
@@ -165,22 +176,37 @@ def generate_code(length: int = 7) -> str:
             conn.close()
 
 def generate_device_id() -> str:
-    """Генерирует псевдослучайный числовой device id в формате, похожем на настоящий Happ."""
     return ''.join(random.choices(string.digits, k=18))
 
 def save_link(link_type: str, content: str, owner_id: int, name: str = None, device_id: str = None) -> str:
+    """Сохраняет ссылку с ПОЛНЫМ логированием"""
     code = generate_code()
-    with db_lock:
-        conn = get_db()
-        try:
-            conn.execute(
-                'INSERT INTO links (code, type, content, owner_id, name, device_id) VALUES (?, ?, ?, ?, ?, ?)',
-                (code, link_type, content, owner_id, name, device_id)
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    return code
+    try:
+        with db_lock:
+            conn = get_db()
+            try:
+                log_info("save_link", f"INSERTING: code={code}, type={link_type}, owner={owner_id}, name={name}")
+                
+                conn.execute(
+                    'INSERT INTO links (code, type, content, owner_id, name, device_id) VALUES (?, ?, ?, ?, ?, ?)',
+                    (code, link_type, content, owner_id, name, device_id)
+                )
+                conn.commit()
+                
+                # ПРОВЕРКА: убеждаемся что вставилось
+                check = conn.execute('SELECT 1 FROM links WHERE code = ?', (code,)).fetchone()
+                if check:
+                    log_info("save_link", f"✅ SUCCESS: код {code} сохранён в БД")
+                else:
+                    log_error("save_link", f"❌ VERIFICATION FAILED: код {code} не найден после вставки")
+                    raise Exception(f"Код {code} не сохранился (проверка failed)")
+                
+                return code
+            finally:
+                conn.close()
+    except Exception as e:
+        log_error("save_link", f"❌ FAILED to save code {code}: {e}", e)
+        raise
 
 def get_link(code: str):
     with db_lock:
@@ -233,8 +259,6 @@ def update_link_name(code: str, owner_id: int, name: str) -> bool:
             conn.close()
 
 def update_link_device_id(code: str, owner_id: int, device_id: str) -> bool:
-    """Меняет HWID (device id), который используется при скачивании подписки у апстрима.
-    Работает только для ссылок типа 'url' — вызывающий код должен это проверить сам."""
     with db_lock:
         conn = get_db()
         try:
@@ -251,12 +275,6 @@ def build_short_url(code: str) -> str:
     return f"{BASE_URL}/{code}"
 
 # ==================== HTTP-СЕРВЕР ====================
-# Ключевое изменение: ссылка типа 'url' — это ЖИВАЯ подписка.
-# Каждый раз, когда её открывает клиент (Happ/v2rayNG/...), наш сервер
-# сам, прямо сейчас, ходит на исходный апстрим-сервер, представляясь
-# клиентом Happ (с указанным HWID), скачивает актуальный конфиг и
-# отдаёт его дальше. Ничего не кешируется — подписка всегда "живая"
-# и обновляется вместе с апстримом.
 
 app = Flask(__name__)
 
@@ -266,37 +284,35 @@ def health_check():
 
 @app.route('/<code>')
 def resolve_link(code):
+    log_info("HTTP", f"GET /{code}")
+    
     row = get_link(code)
     if not row:
+        log_info("HTTP", f"❌ Код {code} НЕ НАЙДЕН в БД → 404")
         abort(404)
 
     link_type, content, name, device_id = row
+    log_info("HTTP", f"✅ Найден: type={link_type}, name={name}")
 
     if link_type == 'url':
-        # content — это исходный (реальный) URL подписки апстрима.
-        # Живём заново каждый раз: имитируем Happ-клиент с нужным HWID.
         try:
             configs_text = fetch_and_decode_configs(content, device_id=device_id)
             if configs_text.startswith("UPSTREAM_UNREACHABLE:"):
-                # Хост апстрима не отвечает на уровне сети — отдаём явную
-                # ошибку сразу, а не молчим и не притворяемся 200.
                 return Response(configs_text, status=502, mimetype='text/plain; charset=utf-8')
             keys = extract_keys(configs_text)
             if keys:
                 body = "\n".join(keys)
                 return Response(body, mimetype='text/plain; charset=utf-8')
-            # Если извлечь ключи не получилось — отдаём то, что получили,
-            # как есть (может пригодиться клиенту, если это уже готовый sub-формат).
             return Response(configs_text, mimetype='text/plain; charset=utf-8')
         except Exception as e:
-            print(f"[ОШИБКА проксирования {code}]: {e}")
+            log_error("resolve_link", f"Ошибка при получении конфига {code}: {e}", e)
             abort(502)
     else:
-        # type == 'keys' — статически сохранённые ключи, HWID тут не участвует.
         return Response(content, mimetype='text/plain; charset=utf-8')
 
 def run_http_server():
-    app.run(host='0.0.0.0', port=PORT)
+    log_info("HTTP", "Запуск на 0.0.0.0:3000")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
 
@@ -317,7 +333,7 @@ def is_subscribed(user_id: int) -> bool:
         member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
         return member.status in ('member', 'administrator', 'creator')
     except Exception as e:
-        print(f"[ОШИБКА проверки подписки]: {e}")
+        log_error("is_subscribed", f"{e}")
         return False
 
 def send_subscribe_prompt(chat_id: int):
@@ -357,7 +373,7 @@ def decrypt_happ_link(encrypted_link: str) -> str:
             return data.get("result", "")
         return ""
     except Exception as e:
-        print(f"Ошибка API дешифровки: {e}")
+        log_error("decrypt_happ_link", f"{e}")
         return ""
 
 def try_decode_base64(text: str) -> str:
@@ -517,14 +533,14 @@ def convert_xray_json_to_links(text: str) -> list:
             try:
                 uri = converter(ob, remarks)
             except Exception as e:
-                print(f"[Ошибка конвертации outbound {proto}]: {e}")
+                log_error("convert_xray", f"proto {proto}: {e}")
                 uri = None
             if uri:
                 links.append(uri)
 
     return links
 
-# ==================== ГЛАВНАЯ ФУНКЦИЯ — ЭМУЛЯЦИЯ Happ ====================
+# ==================== ХАПП ЭМУЛЯЦИЯ ====================
 
 def _happ_headers(device_id: str = None) -> dict:
     dev = device_id or DEFAULT_DEVICE_ID
@@ -538,27 +554,9 @@ def _happ_headers(device_id: str = None) -> dict:
     }
 
 class UpstreamUnreachable(Exception):
-    """Апстрим-хост не отвечает на уровне TCP/DNS (не HTTP-ошибка).
-    В этом случае нет смысла перебирать другие пути/форматы на том же хосте —
-    это, скорее всего, бан IP-диапазона Railway/датацентра со стороны продавца
-    подписки, а не проблема заголовков/HWID."""
     pass
 
-
 def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
-    """
-    Эмулирует запрос от Happ/<version>/Android/<device_id>.
-    device_id (HWID) можно задать под конкретную подписку — это влияет
-    ТОЛЬКО на то, каким устройством бот представляется апстриму при
-    скачивании конфигурации, и никак не связано с ключами, которые
-    сохраняются через /addkeys.
-    Пробует разные комбинации заголовков и параметров, чтобы получить
-    реальные конфигурации. Если хост недоступен на сетевом уровне —
-    сразу останавливается вместо перебора всех вариантов (иначе это
-    занимает больше минуты и клиент отваливается по таймауту раньше,
-    чем мы успеваем ответить).
-    """
-
     def fetch_with_headers(u, headers=None):
         if headers is None:
             headers = _happ_headers(device_id)
@@ -579,7 +577,6 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
             content = resp.text
         return resp, content
 
-    # Шаг 1: обычный запрос с базовыми заголовками Happ
     try:
         resp, body = fetch_with_headers(url)
         ct = resp.headers.get('Content-Type', '')
@@ -594,12 +591,10 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
                 if not is_html(ct2, body2) and body2:
                     return try_decode_base64(body2)
     except UpstreamUnreachable as e:
-        print(f"[Шаг 1] апстрим недоступен: {e}")
-        return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает (сетевой таймаут). Похоже, хост блокирует IP сервера."
+        return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает"
     except Exception as e:
-        print(f"[Шаг 1] ошибка: {e}")
+        log_error("fetch step1", f"{e}")
 
-    # Шаг 2: меняем Accept на application/json
     try:
         headers_json = _happ_headers(device_id)
         headers_json["Accept"] = "application/json"
@@ -608,12 +603,10 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
         if not is_html(ct, body) and body:
             return try_decode_base64(body)
     except UpstreamUnreachable as e:
-        print(f"[Шаг 2] апстрим недоступен: {e}")
-        return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает (сетевой таймаут). Похоже, хост блокирует IP сервера."
+        return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает"
     except Exception as e:
-        print(f"[Шаг 2] ошибка: {e}")
+        log_error("fetch step2", f"{e}")
 
-    # Шаг 3: добавляем параметры ?format=clash, ?app=happ, /sub/
     base = url.rstrip("/")
     token = base.split("/")[-1] if "/sub/" not in base else ""
     origin = "/".join(base.split("/")[:-1]) if "/sub/" not in base else base
@@ -636,10 +629,9 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
             if not is_html(ct, body) and body:
                 return try_decode_base64(body)
         except UpstreamUnreachable as e:
-            print(f"[Альтернатива {alt_url}] апстрим недоступен: {e}")
-            return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает (сетевой таймаут). Похоже, хост блокирует IP сервера."
+            return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает"
         except Exception as e:
-            print(f"[Альтернатива {alt_url}] ошибка: {e}")
+            log_error(f"fetch alt {alt_url}", f"{e}")
 
     return body if 'body' in locals() else "Не удалось получить подписку"
 
@@ -869,7 +861,7 @@ def handle_edit_device(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("device_random:"))
 def handle_device_random(call):
     code = call.data.split(":", 1)[1]
-    row = get_link_full(call.data.split(":", 1)[1])
+    row = get_link_full(code)
     if not row or row[2] != call.from_user.id or row[0] != 'url':
         bot.answer_callback_query(call.id, "Недоступно для этой ссылки.", show_alert=True)
         return
@@ -913,7 +905,7 @@ def process_device_custom(message, code, owner_id):
     else:
         safe_reply_to(message, with_footer("Ошибка обновления HWID."))
 
-# ==================== /shorten (создание живой подписки) ====================
+# ==================== /shorten ====================
 
 user_data = {}
 user_data_lock = threading.Lock()
@@ -980,18 +972,30 @@ def process_name(message):
     )
 
 def _finalize_shorten(chat_id: int, user_id: int, device_id: str = None):
+    """✅ С ЛОГИРОВАНИЕМ И ОБРАБОТКОЙ ОШИБОК"""
     with user_data_lock:
         data = user_data.pop(user_id, None)
     if not data:
         safe_send_message(chat_id, with_footer("Сессия истекла. Начните заново через /shorten."))
         return
+    
     url = data['url']
     name = data['name']
-    code = save_link('url', url, user_id, name=name, device_id=device_id)
-    short_url = build_short_url(code)
-    hwid_line = f"\n🆔 HWID: {device_id}" if device_id else "\n🆔 HWID: стандартный"
-    response_text = f"✅ Подписка создана!\n\n📌 Название: {name}\n🔗 {short_url}{hwid_line}\n\nСсылка живая — при каждом обновлении в клиенте бот заново заберёт актуальный конфиг с исходного сервера."
-    safe_send_message(chat_id, with_footer(response_text))
+    
+    try:
+        log_info("shorten", f"user={user_id}, name={name}, url={url[:50]}...")
+        code = save_link('url', url, user_id, name=name, device_id=device_id)
+        # ↑ Если здесь ошибка — она ВИДНА в логах!
+        
+        short_url = build_short_url(code)
+        hwid_line = f"\n🆔 HWID: {device_id}" if device_id else "\n🆔 HWID: стандартный"
+        response_text = f"✅ Подписка создана!\n\n📌 Название: {name}\n🔗 {short_url}{hwid_line}\n\nСсылка живая — при каждом обновлении в клиенте бот заново заберёт актуальный конфиг с исходного сервера."
+        safe_send_message(chat_id, with_footer(response_text))
+        log_info("shorten", f"✅ SUCCESS: создана подписка {code}")
+        
+    except Exception as e:
+        log_error("shorten", f"❌ FAILED: {e}", e)
+        safe_send_message(chat_id, with_footer(f"❌ Ошибка при создании подписки:\n{e}"))
 
 @bot.callback_query_handler(func=lambda call: call.data == "new_device:default")
 def handle_new_device_default(call):
@@ -1021,7 +1025,7 @@ def process_new_device_custom(message):
         return
     _finalize_shorten(message.chat.id, message.from_user.id, device_id=value)
 
-# ==================== /addkeys (без HWID — статичные ключи) ====================
+# ==================== /addkeys ====================
 
 @bot.message_handler(commands=['addkeys'])
 def cmd_addkeys(message):
@@ -1042,6 +1046,7 @@ def cmd_addkeys(message):
     bot.register_next_step_handler(msg, process_addkeys)
 
 def process_addkeys(message):
+    """✅ С ЛОГИРОВАНИЕМ И ОБРАБОТКОЙ ОШИБОК"""
     try:
         if not is_subscribed(message.from_user.id):
             send_subscribe_prompt(message.chat.id)
@@ -1055,18 +1060,20 @@ def process_addkeys(message):
             return
 
         content = "\n".join(keys)
-        # device_id намеренно не передаётся — ключи статичны и HWID к ним не относится.
-        code = save_link('keys', content, message.from_user.id, name=None)
-        short_url = build_short_url(code)
-        safe_reply_to(message, with_footer(f"✅ Ключи сохранены!\n\nСсылка:\n{short_url}"))
-    except Exception as e:
-        print(f"[ERROR] process_addkeys: {e}")
-        import traceback
-        traceback.print_exc()
+        
         try:
-            safe_reply_to(message, with_footer(f"Ошибка: {e}"))
-        except Exception:
-            pass
+            log_info("addkeys", f"user={message.from_user.id}, keys={len(keys)}")
+            code = save_link('keys', content, message.from_user.id, name=None)
+            short_url = build_short_url(code)
+            safe_reply_to(message, with_footer(f"✅ Ключи сохранены!\n\nСсылка:\n{short_url}"))
+            log_info("addkeys", f"✅ SUCCESS: создано {code}")
+        except Exception as e:
+            log_error("addkeys", f"❌ save_link failed: {e}", e)
+            safe_reply_to(message, with_footer(f"❌ Ошибка при сохранении:\n{e}"))
+            
+    except Exception as e:
+        log_error("addkeys", f"❌ process_addkeys failed: {e}", e)
+        safe_reply_to(message, with_footer(f"❌ Ошибка: {e}"))
 
 # ==================== ОБРАБОТЧИК ТЕКСТА ====================
 
@@ -1091,7 +1098,7 @@ def handle_text(message):
             safe_reply_to(message, with_footer("Загружаю подписку как клиент Happ..."))
             configs_text = fetch_and_decode_configs(text)
 
-            if configs_text.startswith("Сетевая ошибка") or configs_text.startswith("Внутренняя ошибка") or not configs_text:
+            if configs_text.startswith("UPSTREAM_UNREACHABLE") or not configs_text:
                 safe_reply_to(message, with_footer(configs_text or "Пустой ответ от сервера."))
                 return
 
@@ -1120,31 +1127,27 @@ def handle_text(message):
         else:
             safe_reply_to(message, with_footer("Неверный формат. Используйте /shorten, /addkeys или отправьте ссылку на подписку."))
     except Exception as e:
-        print(f"[ERROR] handle_text: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            safe_reply_to(message, with_footer(f"Ошибка: {e}"))
-        except Exception:
-            pass
+        log_error("handle_text", f"{e}", e)
+        safe_reply_to(message, with_footer(f"❌ Ошибка: {e}"))
 
 # ==================== ЗАПУСК ====================
 
 if __name__ == '__main__':
-    import traceback
     try:
         print("[START] Запуск бота...")
         conn = get_db()
+        count = conn.execute('SELECT COUNT(*) FROM links').fetchone()[0]
         conn.close()
-        print("[START] База данных инициализирована")
+        log_info("init", f"БД инициализирована. Ссылок в БД: {count}")
+        
         http_thread = threading.Thread(target=run_http_server, daemon=True)
         http_thread.start()
         print("[START] HTTP сервер запущен")
+        
         bot.remove_webhook()
         print("[START] Webhook удалён")
         print("[START] Запуск polling...")
         bot.polling(none_stop=True)
-    except Exception:
-        traceback.print_exc()
-    finally:
-        input("\nНажмите Enter, чтобы закрыть окно...")
+    except Exception as e:
+        log_error("main", f"Fatal error: {e}", e)
+        input("\nOшибка. Нажмите Enter...")
