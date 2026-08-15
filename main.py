@@ -20,6 +20,13 @@ import traceback  # ← ДОБАВИЛИ
 
 from flask import Flask, abort, Response, request
 
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    cffi_requests = None
+    HAS_CURL_CFFI = False
+
 # ==================== КОНФИГУРАЦИЯ ====================
 
 TOKEN = os.getenv('TOKEN')
@@ -186,13 +193,13 @@ def save_link(link_type: str, content: str, owner_id: int, name: str = None, dev
             conn = get_db()
             try:
                 log_info("save_link", f"INSERTING: code={code}, type={link_type}, owner={owner_id}, name={name}")
-                
+
                 conn.execute(
                     'INSERT INTO links (code, type, content, owner_id, name, device_id) VALUES (?, ?, ?, ?, ?, ?)',
                     (code, link_type, content, owner_id, name, device_id)
                 )
                 conn.commit()
-                
+
                 # ПРОВЕРКА: убеждаемся что вставилось
                 check = conn.execute('SELECT 1 FROM links WHERE code = ?', (code,)).fetchone()
                 if check:
@@ -200,7 +207,7 @@ def save_link(link_type: str, content: str, owner_id: int, name: str = None, dev
                 else:
                     log_error("save_link", f"❌ VERIFICATION FAILED: код {code} не найден после вставки")
                     raise Exception(f"Код {code} не сохранился (проверка failed)")
-                
+
                 return code
             finally:
                 conn.close()
@@ -285,7 +292,7 @@ def health_check():
 @app.route('/<code>')
 def resolve_link(code):
     log_info("HTTP", f"GET /{code}")
-    
+
     row = get_link(code)
     if not row:
         log_info("HTTP", f"❌ Код {code} НЕ НАЙДЕН в БД → 404")
@@ -556,20 +563,52 @@ def _happ_headers(device_id: str = None) -> dict:
 class UpstreamUnreachable(Exception):
     pass
 
+def _raw_get(u: str, headers: dict, timeout: int = 25):
+    """
+    Выполняет GET-запрос к апстриму подписки.
+
+    Использует curl_cffi (если установлен), который имитирует настоящий
+    TLS/JA3-отпечаток браузера Chrome. Это нужно потому, что многие панели
+    (в т.ч. remnawave) стоят за Cloudflare / anti-bot защитой, которая режет
+    соединение ещё на этапе TLS handshake для "нестандартных" клиентов —
+    обычный requests/urllib3/curl из телефона-браузера такой фильтр проходит,
+    а с сервера — нет (симптом: ConnectionError/handshake failed, а не
+    HTTP-ошибка, потому что до HTTP-уровня соединение не доходит).
+
+    Если curl_cffi не установлен — падаем обратно на requests (менее надёжно
+    против anti-bot, но хотя бы не роняет бота, если пакет не поставили).
+    """
+    if HAS_CURL_CFFI:
+        try:
+            resp = cffi_requests.get(
+                u,
+                headers=headers,
+                timeout=timeout,
+                impersonate="chrome124",
+            )
+            return resp
+        except Exception as e:
+            raise UpstreamUnreachable(f"curl_cffi: {e}") from e
+    else:
+        session = requests.Session()
+        session.headers.update(headers)
+        try:
+            resp = session.get(u, timeout=(10, timeout), stream=True)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            raise UpstreamUnreachable(f"requests: {e}") from e
+        return resp
+
 def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
     def fetch_with_headers(u, headers=None):
         if headers is None:
             headers = _happ_headers(device_id)
-        session = requests.Session()
-        session.headers.update(headers)
-        try:
-            resp = session.get(u, timeout=(6, 15), stream=True)
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            raise UpstreamUnreachable(str(e)) from e
-        resp.raise_for_status()
-        if resp.headers.get('Content-Encoding') == 'gzip':
+        resp = _raw_get(u, headers)
+        if resp.status_code >= 400:
+            raise UpstreamUnreachable(f"HTTP {resp.status_code}")
+        raw_bytes = resp.content
+        if resp.headers.get('Content-Encoding') == 'gzip' and raw_bytes[:2] == b'\x1f\x8b':
             try:
-                gz = gzip.GzipFile(fileobj=io.BytesIO(resp.content))
+                gz = gzip.GzipFile(fileobj=io.BytesIO(raw_bytes))
                 content = gz.read().decode('utf-8')
             except Exception:
                 content = resp.text
@@ -591,9 +630,10 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
                 if not is_html(ct2, body2) and body2:
                     return try_decode_base64(body2)
     except UpstreamUnreachable as e:
-        return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает"
+        log_error("fetch step1", f"upstream unreachable: {e}", e)
+        return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает ({e})"
     except Exception as e:
-        log_error("fetch step1", f"{e}")
+        log_error("fetch step1", f"{e}", e)
 
     try:
         headers_json = _happ_headers(device_id)
@@ -603,9 +643,10 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
         if not is_html(ct, body) and body:
             return try_decode_base64(body)
     except UpstreamUnreachable as e:
-        return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает"
+        log_error("fetch step2", f"upstream unreachable: {e}", e)
+        return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает ({e})"
     except Exception as e:
-        log_error("fetch step2", f"{e}")
+        log_error("fetch step2", f"{e}", e)
 
     base = url.rstrip("/")
     token = base.split("/")[-1] if "/sub/" not in base else ""
@@ -629,9 +670,10 @@ def fetch_and_decode_configs(url: str, device_id: str = None) -> str:
             if not is_html(ct, body) and body:
                 return try_decode_base64(body)
         except UpstreamUnreachable as e:
-            return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает"
+            log_error(f"fetch alt {alt_url}", f"upstream unreachable: {e}", e)
+            return f"UPSTREAM_UNREACHABLE: {urllib.parse.urlparse(url).netloc} не отвечает ({e})"
         except Exception as e:
-            log_error(f"fetch alt {alt_url}", f"{e}")
+            log_error(f"fetch alt {alt_url}", f"{e}", e)
 
     return body if 'body' in locals() else "Не удалось получить подписку"
 
@@ -978,21 +1020,21 @@ def _finalize_shorten(chat_id: int, user_id: int, device_id: str = None):
     if not data:
         safe_send_message(chat_id, with_footer("Сессия истекла. Начните заново через /shorten."))
         return
-    
+
     url = data['url']
     name = data['name']
-    
+
     try:
         log_info("shorten", f"user={user_id}, name={name}, url={url[:50]}...")
         code = save_link('url', url, user_id, name=name, device_id=device_id)
         # ↑ Если здесь ошибка — она ВИДНА в логах!
-        
+
         short_url = build_short_url(code)
         hwid_line = f"\n🆔 HWID: {device_id}" if device_id else "\n🆔 HWID: стандартный"
         response_text = f"✅ Подписка создана!\n\n📌 Название: {name}\n🔗 {short_url}{hwid_line}\n\nСсылка живая — при каждом обновлении в клиенте бот заново заберёт актуальный конфиг с исходного сервера."
         safe_send_message(chat_id, with_footer(response_text))
         log_info("shorten", f"✅ SUCCESS: создана подписка {code}")
-        
+
     except Exception as e:
         log_error("shorten", f"❌ FAILED: {e}", e)
         safe_send_message(chat_id, with_footer(f"❌ Ошибка при создании подписки:\n{e}"))
@@ -1060,7 +1102,7 @@ def process_addkeys(message):
             return
 
         content = "\n".join(keys)
-        
+
         try:
             log_info("addkeys", f"user={message.from_user.id}, keys={len(keys)}")
             code = save_link('keys', content, message.from_user.id, name=None)
@@ -1070,7 +1112,7 @@ def process_addkeys(message):
         except Exception as e:
             log_error("addkeys", f"❌ save_link failed: {e}", e)
             safe_reply_to(message, with_footer(f"❌ Ошибка при сохранении:\n{e}"))
-            
+
     except Exception as e:
         log_error("addkeys", f"❌ process_addkeys failed: {e}", e)
         safe_reply_to(message, with_footer(f"❌ Ошибка: {e}"))
@@ -1139,11 +1181,11 @@ if __name__ == '__main__':
         count = conn.execute('SELECT COUNT(*) FROM links').fetchone()[0]
         conn.close()
         log_info("init", f"БД инициализирована. Ссылок в БД: {count}")
-        
+
         http_thread = threading.Thread(target=run_http_server, daemon=True)
         http_thread.start()
         print("[START] HTTP сервер запущен")
-        
+
         bot.remove_webhook()
         print("[START] Webhook удалён")
         print("[START] Запуск polling...")
