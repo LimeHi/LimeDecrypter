@@ -10,31 +10,25 @@ import threading
 import time
 import json
 import urllib.parse
-import hashlib
-import hmac
-import uuid
-import gzip
-import io
 
-from flask import Flask, abort, Response, request
+from flask import Flask, abort, Response
 
-# ==================== КОНФИГУРАЦИЯ ====================
+# ==================== КОНФИГУРАЦИЯ (переменные окружения) ====================
 
-TOKEN = os.getenv('TOKEN')
-CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME')
-FOOTER_TAG = os.getenv('FOOTER_TAG', '')
-FILE_PREFIX = os.getenv('FILE_PREFIX', 'keys')
-BASE_URL = os.getenv('BASE_URL')
-PORT = int(os.getenv('PORT', '3000'))
-DATA_DIR = os.getenv('DATA_DIR', '/app/data')
-BYPASS_SECRET = os.getenv('BYPASS_SECRET', 'default_secret_change_me')  # больше не используется, но пусть остаётся
+TOKEN = os.getenv('TOKEN')                        # токен бота от @BotFather
+CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME')   # канал, подписка обязательна, формат: @название
+FOOTER_TAG = os.getenv('FOOTER_TAG', '')           # подпись под сообщениями
+FILE_PREFIX = os.getenv('FILE_PREFIX', 'keys')     # префикс имени файла с ключами
+BASE_URL = os.getenv('BASE_URL')                   # публичный домен бота, напр. https://limedecrypter.bothost.tech
+PORT = int(os.getenv('PORT', '3000'))              # порт, на котором BotHost даёт публичный доступ
+DATA_DIR = os.getenv('DATA_DIR', '/app/data')      # директория для хранения базы (постоянное хранилище)
 
 if not TOKEN:
-    raise ValueError("TOKEN не задана")
+    raise ValueError("Переменная окружения TOKEN не задана")
 if not CHANNEL_USERNAME:
-    raise ValueError("CHANNEL_USERNAME не задана")
+    raise ValueError("Переменная окружения CHANNEL_USERNAME не задана")
 if not BASE_URL:
-    raise ValueError("BASE_URL не задана")
+    raise ValueError("Переменная окружения BASE_URL не задана (например: https://limedecrypter.bothost.tech)")
 
 BASE_URL = BASE_URL.rstrip('/')
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -45,902 +39,902 @@ bot = telebot.TeleBot(TOKEN)
 telebot.apihelper.READ_TIMEOUT = 60
 telebot.apihelper.CONNECT_TIMEOUT = 60
 
-# ==================== ВРЕМЕННОЕ ХРАНИЛИЩЕ (для команд) ====================
-
-pending_saves = {}
-pending_saves_lock = threading.Lock()
-
-def create_pending_save(content: str) -> str:
-    session_id = str(uuid.uuid4())[:8]
-    with pending_saves_lock:
-        pending_saves[session_id] = content
-    return session_id
-
-def get_pending_save(session_id: str) -> str:
-    with pending_saves_lock:
-        return pending_saves.pop(session_id, None)
-
-def cleanup_pending_saves():
-    while True:
-        time.sleep(300)
-        with pending_saves_lock:
-            if len(pending_saves) > 1000:
-                keys = list(pending_saves.keys())[:500]
-                for k in keys:
-                    pending_saves.pop(k, None)
-
-cleanup_thread = threading.Thread(target=cleanup_pending_saves, daemon=True)
-cleanup_thread.start()
-
 def safe_send_message(chat_id, text, retries=3, delay=2, **kwargs):
-    for attempt in range(1, retries + 1):
-        try:
-            return bot.send_message(chat_id, text, **kwargs)
-        except requests.exceptions.ReadTimeout as e:
-            time.sleep(delay)
-        except Exception as e:
-            print(f"[Ошибка send_message]: {e}")
-            raise
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return bot.send_message(chat_id, text, **kwargs)
+        except requests.exceptions.ReadTimeout as e:
+            last_error = e
+            print(f"[Таймаут send_message, попытка {attempt}/{retries}]: {e}")
+            time.sleep(delay)
+        except Exception as e:
+            last_error = e
+            print(f"[Ошибка send_message]: {e}")
+            break
+    if last_error:
+        raise last_error
 
 def safe_send_document(chat_id, document, retries=3, delay=2, **kwargs):
-    for attempt in range(1, retries + 1):
-        try:
-            return bot.send_document(chat_id, document, **kwargs)
-        except requests.exceptions.ReadTimeout as e:
-            time.sleep(delay)
-            if hasattr(document, 'seek'):
-                try:
-                    document.seek(0)
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[Ошибка send_document]: {e}")
-            raise
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return bot.send_document(chat_id, document, **kwargs)
+        except requests.exceptions.ReadTimeout as e:
+            last_error = e
+            print(f"[Таймаут send_document, попытка {attempt}/{retries}]: {e}")
+            time.sleep(delay)
+            if hasattr(document, 'seek'):
+                try:
+                    document.seek(0)
+                except Exception:
+                    pass
+        except Exception as e:
+            last_error = e
+            print(f"[Ошибка send_document]: {e}")
+            break
+    if last_error:
+        raise last_error
 
 def safe_reply_to(message, text, retries=3, delay=2, **kwargs):
-    for attempt in range(1, retries + 1):
-        try:
-            return bot.reply_to(message, text, **kwargs)
-        except requests.exceptions.ReadTimeout as e:
-            time.sleep(delay)
-        except Exception as e:
-            print(f"[Ошибка reply_to]: {e}")
-            raise
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return bot.reply_to(message, text, **kwargs)
+        except requests.exceptions.ReadTimeout as e:
+            last_error = e
+            print(f"[Таймаут reply_to, попытка {attempt}/{retries}]: {e}")
+            time.sleep(delay)
+        except Exception as e:
+            last_error = e
+            print(f"[Ошибка reply_to]: {e}")
+            break
+    if last_error:
+        raise last_error
 
-# ==================== БАЗА ДАННЫХ (только для коротких ссылок, HWID удалён) ====================
+# ==================== БАЗА ДАННЫХ (короткие ссылки) ====================
 
 db_lock = threading.Lock()
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS links (
-            code TEXT PRIMARY KEY,
-            type TEXT NOT NULL,
-            content TEXT NOT NULL,
-            owner_id INTEGER,
-            name TEXT DEFAULT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    # Удаляем столбцы hwid* если они есть (чтобы не мешались), но это не критично
-    try:
-        conn.execute('SELECT hwid_bypass FROM links LIMIT 1')
-        conn.execute('ALTER TABLE links DROP COLUMN hwid_bypass')
-    except:
-        pass
-    try:
-        conn.execute('SELECT hwid FROM links LIMIT 1')
-        conn.execute('ALTER TABLE links DROP COLUMN hwid')
-    except:
-        pass
-    return conn
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS links (
+            code TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            owner_id INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    return conn
 
 def generate_code(length: int = 7) -> str:
-    alphabet = string.ascii_letters + string.digits
-    with db_lock:
-        conn = get_db()
-        try:
-            while True:
-                code = ''.join(random.choices(alphabet, k=length))
-                exists = conn.execute('SELECT 1 FROM links WHERE code = ?', (code,)).fetchone()
-                if not exists:
-                    return code
-        finally:
-            conn.close()
+    alphabet = string.ascii_letters + string.digits
+    with db_lock:
+        conn = get_db()
+        try:
+            while True:
+                code = ''.join(random.choices(alphabet, k=length))
+                exists = conn.execute('SELECT 1 FROM links WHERE code = ?', (code,)).fetchone()
+                if not exists:
+                    return code
+        finally:
+            conn.close()
 
-def save_link(link_type: str, content: str, owner_id: int, name: str = None) -> str:
-    code = generate_code()
-    with db_lock:
-        conn = get_db()
-        try:
-            conn.execute(
-                'INSERT INTO links (code, type, content, owner_id, name) VALUES (?, ?, ?, ?, ?)',
-                (code, link_type, content, owner_id, name)
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    return code
+def save_link(link_type: str, content: str, owner_id: int) -> str:
+    code = generate_code()
+    with db_lock:
+        conn = get_db()
+        try:
+            conn.execute(
+                'INSERT INTO links (code, type, content, owner_id) VALUES (?, ?, ?, ?)',
+                (code, link_type, content, owner_id)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return code
 
 def get_link(code: str):
-    with db_lock:
-        conn = get_db()
-        try:
-            row = conn.execute('SELECT type, content, name FROM links WHERE code = ?', (code,)).fetchone()
-            return row
-        finally:
-            conn.close()
+    with db_lock:
+        conn = get_db()
+        try:
+            row = conn.execute('SELECT type, content FROM links WHERE code = ?', (code,)).fetchone()
+            return row
+        finally:
+            conn.close()
 
 def get_link_full(code: str):
-    with db_lock:
-        conn = get_db()
-        try:
-            row = conn.execute('SELECT type, content, owner_id, name FROM links WHERE code = ?', (code,)).fetchone()
-            return row
-        finally:
-            conn.close()
+    with db_lock:
+        conn = get_db()
+        try:
+            row = conn.execute('SELECT type, content, owner_id FROM links WHERE code = ?', (code,)).fetchone()
+            return row
+        finally:
+            conn.close()
 
 def get_links_by_owner(owner_id: int, limit: int = 20):
-    with db_lock:
-        conn = get_db()
-        try:
-            rows = conn.execute(
-                'SELECT code, type, content, created_at, name FROM links WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
-                (owner_id, limit)
-            ).fetchall()
-            return rows
-        finally:
-            conn.close()
+    with db_lock:
+        conn = get_db()
+        try:
+            rows = conn.execute(
+                'SELECT code, type, content, created_at FROM links WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
+                (owner_id, limit)
+            ).fetchall()
+            return rows
+        finally:
+            conn.close()
 
 def delete_link(code: str, owner_id: int) -> bool:
-    with db_lock:
-        conn = get_db()
-        try:
-            cur = conn.execute('DELETE FROM links WHERE code = ? AND owner_id = ?', (code, owner_id))
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
+    with db_lock:
+        conn = get_db()
+        try:
+            cur = conn.execute('DELETE FROM links WHERE code = ? AND owner_id = ?', (code, owner_id))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
 
-def update_link_name(code: str, owner_id: int, name: str) -> bool:
-    with db_lock:
-        conn = get_db()
-        try:
-            cur = conn.execute('UPDATE links SET name = ? WHERE code = ? AND owner_id = ?', (name, code, owner_id))
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
+def update_link_content(code: str, owner_id: int, new_content: str) -> bool:
+    with db_lock:
+        conn = get_db()
+        try:
+            cur = conn.execute(
+                'UPDATE links SET content = ? WHERE code = ? AND owner_id = ?',
+                (new_content, code, owner_id)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
 
 def build_short_url(code: str) -> str:
-    return f"{BASE_URL}/{code}"
+    return f"{BASE_URL}/{code}"
 
-# ==================== HTTP-СЕРВЕР (без HWID) ====================
+# ==================== HTTP-СЕРВЕР (отдаёт короткие ссылки) ====================
 
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return 'OK'
+    return 'OK'
 
 @app.route('/<code>')
 def resolve_link(code):
-    row = get_link(code)
-    if not row:
-        abort(404)
+    row = get_link(code)
+    if not row:
+        abort(404)
 
-    link_type, content, name = row
+    link_type, content = row
 
-    if link_type == 'url':
-        try:
-            resp = requests.get(content, timeout=15)
-            resp.raise_for_status()
-            return Response(resp.content, mimetype=resp.headers.get('Content-Type', 'text/plain'))
-        except Exception as e:
-            print(f"[ОШИБКА проксирования {code}]: {e}")
-            abort(502)
-    else:
-        return Response(content, mimetype='text/plain')
+    if link_type == 'url':
+        try:
+            resp = requests.get(content, timeout=15)
+            resp.raise_for_status()
+            content_type = resp.headers.get('Content-Type', 'text/plain; charset=utf-8')
+            return Response(resp.content, mimetype=content_type)
+        except Exception as e:
+            print(f"[ОШИБКА проксирования {code}]: {e}")
+            abort(502)
+    else:
+        return Response(content, mimetype='text/plain')
 
 def run_http_server():
-    app.run(host='0.0.0.0', port=PORT)
+    app.run(host='0.0.0.0', port=PORT)
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БОТА ====================
 
 file_counter = 0
 
 def next_file_name() -> str:
-    global file_counter
-    file_counter += 1
-    return f"{FILE_PREFIX}{file_counter}.txt"
+    global file_counter
+    file_counter += 1
+    return f"{FILE_PREFIX}{file_counter}.txt"
 
 def with_footer(text: str) -> str:
-    if FOOTER_TAG:
-        return f"{text}\n\n{FOOTER_TAG}"
-    return text
+    if FOOTER_TAG:
+        return f"{text}\n\n{FOOTER_TAG}"
+    return text
 
 def is_subscribed(user_id: int) -> bool:
-    try:
-        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status in ('member', 'administrator', 'creator')
-    except Exception as e:
-        print(f"[ОШИБКА проверки подписки]: {e}")
-        return False
+    try:
+        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        return member.status in ('member', 'administrator', 'creator')
+    except Exception as e:
+        print(f"[ОШИБКА проверки подписки]: {e}")
+        return False
 
 def send_subscribe_prompt(chat_id: int):
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton(
-        text="Подписаться на канал",
-        url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"
-    ))
-    markup.add(telebot.types.InlineKeyboardButton(
-        text="Я подписался ✅",
-        callback_data="check_sub"
-    ))
-    safe_send_message(chat_id, with_footer(f"Для использования бота необходимо подписаться на канал {CHANNEL_USERNAME}."), reply_markup=markup)
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton(
+        text="Подписаться на канал",
+        url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"
+    ))
+    markup.add(telebot.types.InlineKeyboardButton(
+        text="Я подписался ✅",
+        callback_data="check_sub"
+    ))
+    safe_send_message(
+        chat_id,
+        with_footer(f"Для использования бота необходимо подписаться на канал {CHANNEL_USERNAME}."),
+        reply_markup=markup
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data == "check_sub")
 def handle_check_sub(call):
-    if is_subscribed(call.from_user.id):
-        bot.answer_callback_query(call.id, "Подписка подтверждена ✅")
-        safe_send_message(call.message.chat.id, with_footer("Отлично! Теперь можешь пользоваться ботом."))
-    else:
-        bot.answer_callback_query(call.id, "Подписка не найдена.", show_alert=True)
+    if is_subscribed(call.from_user.id):
+        bot.answer_callback_query(call.id, "Подписка подтверждена ✅")
+        safe_send_message(call.message.chat.id, with_footer("Отлично! Теперь можешь пользоваться ботом."))
+    else:
+        bot.answer_callback_query(call.id, "Подписка не найдена. Подпишись и попробуй снова.", show_alert=True)
 
 KEY_PATTERN = re.compile(
-    r'(?:vless|vmess|trojan|ss|ssr|hysteria2?|hy2|tuic)://[^\s<>"]+',
-    re.IGNORECASE
+    r'(?:vless|vmess|trojan|ss|ssr|hysteria2?|hy2|tuic)://[^\s<>"]+',
+    re.IGNORECASE
 )
 
 def decrypt_happ_link(encrypted_link: str) -> str:
-    endpoint = "https://api.ioo.ir/v1/happ/decrypt"
-    headers = {"Content-Type": "application/json"}
-    payload = {"link": encrypted_link}
-    try:
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("ok"):
-            return data.get("result", "")
-        return ""
-    except Exception as e:
-        print(f"Ошибка API дешифровки: {e}")
-        return ""
+    endpoint = "https://api.ioo.ir/v1/happ/decrypt"
+    headers = {"Content-Type": "application/json"}
+    payload = {"link": encrypted_link}
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("ok"):
+            return data.get("result", "")
+        return ""
+    except Exception as e:
+        print(f"Ошибка API дешифровки: {e}")
+        return ""
 
 def try_decode_base64(text: str) -> str:
-    try:
-        padded = text + '=' * (-len(text) % 4)
-        return base64.b64decode(padded).decode('utf-8')
-    except Exception:
-        return text
+    """Пробует декодировать Base64, иначе возвращает как есть."""
+    try:
+        padded = text + '=' * (-len(text) % 4)
+        return base64.b64decode(padded).decode('utf-8')
+    except Exception:
+        return text
 
 def is_html(content_type: str, body: str) -> bool:
-    return "text/html" in content_type or body.lstrip().startswith(("<html", "<!DOCTYPE", "<!doctype"))
+    return "text/html" in content_type or body.lstrip().startswith(("<html", "<!DOCTYPE", "<!doctype"))
 
-# ==================== КОНВЕРТЕР XRAY/V2RAY JSON -> URI ====================
+# ==================== КОНВЕРТЕР XRAY/V2RAY JSON -> URI-ССЫЛКИ ====================
+#
+# Некоторые подписки (в т.ч. панели, отдающие полный конфиг для приложения
+# Xray/V2Box/NekoBox) возвращают не список vless://.../vmess://... строк,
+# а один JSON-массив полных конфигов вида:
+#   [{ "inbounds": [...], "outbounds": [{ "protocol": "vless", ... }], "remarks": "..." }, ...]
+# Регулярка KEY_PATTERN такой формат не ловит, поэтому нужен отдельный разбор.
+# Служебные outbound'ы (freedom / blackhole / dns) пропускаются — это не сервера.
 
 def _vless_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
-    settings = outbound.get('settings', {}) or {}
-    stream = outbound.get('streamSettings', {}) or {}
+    settings = outbound.get('settings', {}) or {}
+    stream = outbound.get('streamSettings', {}) or {}
 
-    vnext = settings.get('vnext')
-    if vnext:
-        node = vnext[0]
-        address = node.get('address')
-        port = node.get('port')
-        user = (node.get('users') or [{}])[0]
-        uid = user.get('id')
-        encryption = user.get('encryption', settings.get('encryption', 'none'))
-        flow = user.get('flow', '')
-    else:
-        address = settings.get('address')
-        port = settings.get('port')
-        uid = settings.get('id')
-        encryption = settings.get('encryption', 'none')
-        flow = settings.get('flow', '')
+    vnext = settings.get('vnext')
+    if vnext:
+        node = vnext[0]
+        address = node.get('address')
+        port = node.get('port')
+        user = (node.get('users') or [{}])[0]
+        uid = user.get('id')
+        encryption = user.get('encryption', settings.get('encryption', 'none'))
+        flow = user.get('flow', '')
+    else:
+        address = settings.get('address')
+        port = settings.get('port')
+        uid = settings.get('id')
+        encryption = settings.get('encryption', 'none')
+        flow = settings.get('flow', '')
 
-    if not (address and port and uid):
-        return None
+    if not (address and port and uid):
+        return None
 
-    network = stream.get('network', 'tcp')
-    security = stream.get('security', 'none')
+    network = stream.get('network', 'tcp')
+    security = stream.get('security', 'none')
 
-    params = {'encryption': encryption or 'none', 'security': security, 'type': network}
-    if flow:
-        params['flow'] = flow
+    params = {'encryption': encryption or 'none', 'security': security, 'type': network}
+    if flow:
+        params['flow'] = flow
 
-    tls = stream.get('tlsSettings') or stream.get('realitySettings') or {}
-    if tls.get('serverName'):
-        params['sni'] = tls['serverName']
-    if tls.get('fingerprint'):
-        params['fp'] = tls['fingerprint']
-    if tls.get('alpn'):
-        params['alpn'] = ','.join(tls['alpn'])
+    tls = stream.get('tlsSettings') or stream.get('realitySettings') or {}
+    if tls.get('serverName'):
+        params['sni'] = tls['serverName']
+    if tls.get('fingerprint'):
+        params['fp'] = tls['fingerprint']
+    if tls.get('alpn'):
+        params['alpn'] = ','.join(tls['alpn'])
 
-    if network == 'ws':
-        ws = stream.get('wsSettings', {}) or {}
-        if ws.get('path'):
-            params['path'] = ws['path']
-        host = (ws.get('headers') or {}).get('Host') or ws.get('host')
-        if host:
-            params['host'] = host
-    elif network == 'grpc':
-        grpc = stream.get('grpcSettings', {}) or {}
-        if grpc.get('serviceName'):
-            params['serviceName'] = grpc['serviceName']
+    if network == 'ws':
+        ws = stream.get('wsSettings', {}) or {}
+        if ws.get('path'):
+            params['path'] = ws['path']
+        host = (ws.get('headers') or {}).get('Host') or ws.get('host')
+        if host:
+            params['host'] = host
+    elif network == 'grpc':
+        grpc = stream.get('grpcSettings', {}) or {}
+        if grpc.get('serviceName'):
+            params['serviceName'] = grpc['serviceName']
 
-    query = urllib.parse.urlencode(params, safe=',')
-    name = urllib.parse.quote(remarks or '')
-    return f"vless://{uid}@{address}:{port}?{query}#{name}"
+    query = urllib.parse.urlencode(params, safe=',')
+    name = urllib.parse.quote(remarks or '')
+    return f"vless://{uid}@{address}:{port}?{query}#{name}"
 
 def _hysteria_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
-    settings = outbound.get('settings', {}) or {}
-    stream = outbound.get('streamSettings', {}) or {}
-    hy = stream.get('hysteriaSettings', {}) or {}
-    tls = stream.get('tlsSettings', {}) or {}
+    settings = outbound.get('settings', {}) or {}
+    stream = outbound.get('streamSettings', {}) or {}
+    hy = stream.get('hysteriaSettings', {}) or {}
+    tls = stream.get('tlsSettings', {}) or {}
 
-    address = settings.get('address')
-    port = settings.get('port')
-    auth = hy.get('auth')
-    version = hy.get('version') or settings.get('version') or 2
+    address = settings.get('address')
+    port = settings.get('port')
+    auth = hy.get('auth')
+    version = hy.get('version') or settings.get('version') or 2
 
-    if not (address and port and auth):
-        return None
+    if not (address and port and auth):
+        return None
 
-    scheme = 'hysteria2' if version == 2 else 'hysteria'
-    params = {}
-    if tls.get('serverName'):
-        params['sni'] = tls['serverName']
-    if tls.get('alpn'):
-        params['alpn'] = ','.join(tls['alpn'])
+    scheme = 'hysteria2' if version == 2 else 'hysteria'
+    params = {}
+    if tls.get('serverName'):
+        params['sni'] = tls['serverName']
+    if tls.get('alpn'):
+        params['alpn'] = ','.join(tls['alpn'])
 
-    query = urllib.parse.urlencode(params, safe=',')
-    name = urllib.parse.quote(remarks or '')
-    return f"{scheme}://{auth}@{address}:{port}?{query}#{name}"
+    query = urllib.parse.urlencode(params, safe=',')
+    name = urllib.parse.quote(remarks or '')
+    return f"{scheme}://{auth}@{address}:{port}?{query}#{name}"
 
 def _trojan_outbound_to_uri(outbound: dict, remarks: str) -> str | None:
-    settings = outbound.get('settings', {}) or {}
-    stream = outbound.get('streamSettings', {}) or {}
+    settings = outbound.get('settings', {}) or {}
+    stream = outbound.get('streamSettings', {}) or {}
 
-    servers = settings.get('servers')
-    if servers:
-        node = servers[0]
-        address = node.get('address')
-        port = node.get('port')
-        password = node.get('password')
-    else:
-        address = settings.get('address')
-        port = settings.get('port')
-        password = settings.get('password')
+    servers = settings.get('servers')
+    if servers:
+        node = servers[0]
+        address = node.get('address')
+        port = node.get('port')
+        password = node.get('password')
+    else:
+        address = settings.get('address')
+        port = settings.get('port')
+        password = settings.get('password')
 
-    if not (address and port and password):
-        return None
+    if not (address and port and password):
+        return None
 
-    security = stream.get('security', 'tls')
-    params = {'security': security}
-    tls = stream.get('tlsSettings', {}) or {}
-    if tls.get('serverName'):
-        params['sni'] = tls['serverName']
+    security = stream.get('security', 'tls')
+    params = {'security': security}
+    tls = stream.get('tlsSettings', {}) or {}
+    if tls.get('serverName'):
+        params['sni'] = tls['serverName']
 
-    query = urllib.parse.urlencode(params, safe=',')
-    name = urllib.parse.quote(remarks or '')
-    return f"trojan://{password}@{address}:{port}?{query}#{name}"
+    query = urllib.parse.urlencode(params, safe=',')
+    name = urllib.parse.quote(remarks or '')
+    return f"trojan://{password}@{address}:{port}?{query}#{name}"
 
+# Протоколы-заглушки, которые не являются реальными VPN-серверами
 _NON_PROXY_PROTOCOLS = {'freedom', 'blackhole', 'dns'}
 
 _OUTBOUND_CONVERTERS = {
-    'vless': _vless_outbound_to_uri,
-    'hysteria': _hysteria_outbound_to_uri,
-    'hysteria2': _hysteria_outbound_to_uri,
-    'trojan': _trojan_outbound_to_uri,
+    'vless': _vless_outbound_to_uri,
+    'hysteria': _hysteria_outbound_to_uri,
+    'hysteria2': _hysteria_outbound_to_uri,
+    'trojan': _trojan_outbound_to_uri,
 }
 
 def convert_xray_json_to_links(text: str) -> list:
-    try:
-        data = json.loads(text)
-    except Exception:
-        return []
+    """
+    Пытается распарсить текст как JSON-конфиг(и) Xray/V2Ray (один объект
+    или список объектов с полем outbounds) и собрать из них список
+    обычных URI-ссылок (vless://, hysteria2://, trojan://...).
+    Возвращает пустой список, если это не похоже на такой JSON.
+    """
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
 
-    configs = data if isinstance(data, list) else [data]
-    links = []
+    configs = data if isinstance(data, list) else [data]
+    links = []
 
-    for cfg in configs:
-        if not isinstance(cfg, dict):
-            continue
-        outbounds = cfg.get('outbounds')
-        if not isinstance(outbounds, list):
-            continue
+    for cfg in configs:
+        if not isinstance(cfg, dict):
+            continue
+        outbounds = cfg.get('outbounds')
+        if not isinstance(outbounds, list):
+            continue
 
-        remarks = cfg.get('remarks', '')
-        for ob in outbounds:
-            if not isinstance(ob, dict):
-                continue
-            proto = ob.get('protocol')
-            if not proto or proto in _NON_PROXY_PROTOCOLS:
-                continue
-            converter = _OUTBOUND_CONVERTERS.get(proto)
-            if not converter:
-                continue
-            try:
-                uri = converter(ob, remarks)
-            except Exception as e:
-                print(f"[Ошибка конвертации outbound {proto}]: {e}")
-                uri = None
-            if uri:
-                links.append(uri)
+        remarks = cfg.get('remarks', '')
+        for ob in outbounds:
+            if not isinstance(ob, dict):
+                continue
+            proto = ob.get('protocol')
+            if not proto or proto in _NON_PROXY_PROTOCOLS:
+                continue
+            converter = _OUTBOUND_CONVERTERS.get(proto)
+            if not converter:
+                continue
+            try:
+                uri = converter(ob, remarks)
+            except Exception as e:
+                print(f"[Ошибка конвертации outbound {proto}]: {e}")
+                uri = None
+            if uri:
+                links.append(uri)
 
-    return links
-
-# ==================== ГЛАВНАЯ ФУНКЦИЯ — МАКСИМАЛЬНО ПОХОЖА НА Happ ====================
+    return links
 
 def fetch_and_decode_configs(url: str) -> str:
-    """
-    Эмулирует запрос от Happ/3.26.3/Android.
-    Пробует разные комбинации заголовков и параметров, чтобы получить реальные конфигурации.
-    """
-    # Базовые заголовки как у Happ
-    HAPP_HEADERS = {
-        "User-Agent": "Happ/3.26.3/Android/178394521473618780",
-        "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
-    }
+    """
+    Скачивает подписку. Если ответ — HTML (JS-рендер, Marzban и т.п.),
+    пробует несколько обходных вариантов с заголовками VPN-клиента.
+    """
+    VPN_HEADERS = {
+        "User-Agent": "clash.meta",
+        "Accept": "text/plain, application/json, */*",
+    }
 
-    def fetch_with_headers(u, headers=None):
-        if headers is None:
-            headers = HAPP_HEADERS.copy()
-        # Добавляем поддержку сжатия
-        session = requests.Session()
-        session.headers.update(headers)
-        resp = session.get(u, timeout=15, stream=True)
-        resp.raise_for_status()
-        # Если контент закодирован gzip, распаковываем
-        if resp.headers.get('Content-Encoding') == 'gzip':
-            try:
-                gz = gzip.GzipFile(fileobj=io.BytesIO(resp.content))
-                content = gz.read().decode('utf-8')
-            except:
-                content = resp.text
-        else:
-            content = resp.text
-        return resp, content
+    def fetch(u, headers=None):
+        r = requests.get(u, headers=headers or {}, timeout=15)
+        r.raise_for_status()
+        return r
 
-    # Шаг 1: обычный запрос с базовыми заголовками
-    try:
-        resp, body = fetch_with_headers(url)
-        ct = resp.headers.get('Content-Type', '')
-        if not is_html(ct, body) and body:
-            return try_decode_base64(body)
-        # Если HTML, возможно, в нём есть ссылка на реальную подписку
-        if is_html(ct, body):
-            # Ищем в HTML ссылку на подписку
-            match = re.search(r'(https?://[^\s"\'<>]+\.(?:txt|json|xml|conf|cfg|sub))', body, re.IGNORECASE)
-            if match:
-                real_url = match.group(1)
-                resp2, body2 = fetch_with_headers(real_url)
-                ct2 = resp2.headers.get('Content-Type', '')
-                if not is_html(ct2, body2) and body2:
-                    return try_decode_base64(body2)
-    except Exception as e:
-        print(f"[Шаг 1] ошибка: {e}")
+    try:
+        # Шаг 1: обычный запрос
+        resp = fetch(url)
+        ct = resp.headers.get("Content-Type", "")
+        body = resp.text.strip()
 
-    # Шаг 2: меняем Accept на application/json
-    try:
-        headers_json = HAPP_HEADERS.copy()
-        headers_json["Accept"] = "application/json"
-        resp, body = fetch_with_headers(url, headers_json)
-        ct = resp.headers.get('Content-Type', '')
-        if not is_html(ct, body) and body:
-            return try_decode_base64(body)
-    except Exception as e:
-        print(f"[Шаг 2] ошибка: {e}")
+        if not is_html(ct, body):
+            return try_decode_base64(body)
 
-    # Шаг 3: добавляем параметры ?format=clash, ?app=happ, /sub/
-    base = url.rstrip("/")
-    token = base.split("/")[-1] if "/sub/" not in base else ""
-    origin = "/".join(base.split("/")[:-1]) if "/sub/" not in base else base
+        # Шаг 2: тот же URL, но с заголовками VPN-клиента
+        resp2 = fetch(url, VPN_HEADERS)
+        ct2 = resp2.headers.get("Content-Type", "")
+        body2 = resp2.text.strip()
 
-    candidates = []
-    if token:
-        candidates.append(f"{origin}/sub/{token}")
-    candidates.append(f"{base}/sub")
-    candidates.append(f"{base}?format=clash")
-    candidates.append(f"{base}?app=happ")
-    # Если в URL уже есть параметры, пробуем добавить &format=clash
-    if "?" in base:
-        candidates.append(f"{base}&format=clash")
-        candidates.append(f"{base}&app=happ")
-    else:
-        candidates.append(f"{base}?format=clash")
-        candidates.append(f"{base}?app=happ")
+        if not is_html(ct2, body2):
+            return try_decode_base64(body2)
 
-    for alt_url in candidates:
-        try:
-            resp, body = fetch_with_headers(alt_url)
-            ct = resp.headers.get('Content-Type', '')
-            if not is_html(ct, body) and body:
-                return try_decode_base64(body)
-        except Exception as e:
-            print(f"[Альтернатива {alt_url}] ошибка: {e}")
+        # Шаг 3: /sub/<token> — паттерн Marzban и похожих панелей
+        base = url.rstrip("/")
+        # Извлекаем токен из последнего сегмента пути
+        token = base.split("/")[-1]
+        origin = "/".join(base.split("/")[:-1])  # https://domain.com
 
-    # Если ничего не помогло, возвращаем последний полученный текст (возможно, HTML с ошибкой)
-    return body if 'body' in locals() else "Не удалось получить подписку"
+        sub_candidates = [
+            f"{origin}/sub/{token}",
+            f"{base}/sub",
+            f"{base}?format=clash",
+            f"{base}?app=happ",
+        ]
+
+        for alt_url in sub_candidates:
+            try:
+                r = fetch(alt_url, VPN_HEADERS)
+                ct_alt = r.headers.get("Content-Type", "")
+                body_alt = r.text.strip()
+                if not is_html(ct_alt, body_alt) and body_alt:
+                    return try_decode_base64(body_alt)
+            except Exception:
+                continue
+
+        # Ничего не сработало — вернём тело как есть, бот попробует найти ключи
+        return body2
+
+    except requests.exceptions.RequestException as e:
+        return f"Сетевая ошибка при скачивании подписки: {e}"
+    except Exception as e:
+        return f"Внутренняя ошибка обработки: {e}"
 
 def extract_keys(text: str) -> list:
-    keys = KEY_PATTERN.findall(text)
-    if keys:
-        return keys
-    return convert_xray_json_to_links(text)
+    keys = KEY_PATTERN.findall(text)
+    if keys:
+        return keys
+    # Fallback: возможно, это не список ссылок, а JSON-конфиг(и) Xray/V2Ray
+    return convert_xray_json_to_links(text)
 
 def send_keys(chat_id: int, keys: list):
-    joined = "\n".join(keys)
-    file_name = next_file_name()
-    try:
-        with open(file_name, 'w', encoding='utf-8') as file:
-            file.write(joined)
-        with open(file_name, 'rb') as file:
-            safe_send_document(
-                chat_id,
-                file,
-                visible_file_name=file_name,
-                caption=with_footer(f"Найдено ключей: {len(keys)}. Файл во вложении.")
-            )
-    finally:
-        if os.path.exists(file_name):
-            os.remove(file_name)
+    joined = "\n".join(keys)
+    file_name = next_file_name()
+    try:
+        with open(file_name, 'w', encoding='utf-8') as file:
+            file.write(joined)
+        with open(file_name, 'rb') as file:
+            safe_send_document(
+                chat_id,
+                file,
+                visible_file_name=file_name,
+                caption=with_footer(f"Найдено ключей: {len(keys)}. Файл во вложении.")
+            )
+    finally:
+        if os.path.exists(file_name):
+            os.remove(file_name)
 
-# ==================== КОМАНДЫ ====================
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    if not is_subscribed(message.from_user.id):
-        send_subscribe_prompt(message.chat.id)
-        return
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
 
-    welcome_text = (
-        "Здравствуйте.\n\n"
-        "📌 Бот умеет:\n"
-        "• Автоматически расшифровывать ссылки **happ://crypt**.\n"
-        "• Автоматически загружать подписки по **http://** или **https://** ссылкам и извлекать VPN-ключи (vless, vmess, trojan, ss, hysteria и др.) – работает как настоящий клиент Happ.\n"
-        "• /shorten — сократить ссылку на подписку с возможностью задать название.\n"
-        "• /addkeys — сохранить свои ключи и получить короткую ссылку.\n"
-        "• /profile — посмотреть все свои сохранённые ссылки, управлять ими (удалить, изменить название)."
-    )
-    safe_reply_to(message, with_footer(welcome_text))
-
-# ==================== ПРОФИЛЬ (без HWID) ====================
-
-def build_profile_menu(rows: list) -> telebot.types.InlineKeyboardMarkup:
-    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
-    for row in rows:
-        code, link_type, content, created_at, name = row
-        icon = "🔗" if link_type == 'url' else "🔑"
-        display_name = name if name else code
-        markup.add(
-            telebot.types.InlineKeyboardButton(
-                text=f"{icon} {display_name}",
-                callback_data=f"view:{code}"
-            )
-        )
-    return markup
-
-@bot.message_handler(commands=['profile'])
-def cmd_profile(message):
-    if not is_subscribed(message.from_user.id):
-        send_subscribe_prompt(message.chat.id)
-        return
-
-    rows = get_links_by_owner(message.from_user.id)
-
-    if not rows:
-        safe_reply_to(message, with_footer("У вас пока нет сохранённых ссылок."))
-        return
-
-    markup = build_profile_menu(rows)
-    safe_reply_to(
-        message,
-        with_footer(f"Ваши ссылки ({len(rows)}). Нажмите на любую для просмотра деталей:"),
-        reply_markup=markup
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("view:"))
-def handle_view_link(call):
-    code = call.data.split(":", 1)[1]
-    row = get_link_full(code)
-
-    if not row or row[2] != call.from_user.id:
-        bot.answer_callback_query(call.id, "Ссылка не найдена или не ваша.", show_alert=True)
-        return
-
-    link_type, content, owner_id, name = row
-    short_url = build_short_url(code)
-    type_label = "🔗 Ссылка" if link_type == 'url' else "🔑 Ключи"
-    preview = content if len(content) <= 200 else content[:197] + "..."
-
-    text = f"{type_label}\n\n📌 Название: {name or '—'}\n🔗 {short_url}\n\n📄 Содержимое:\n{preview}"
-
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.row(
-        telebot.types.InlineKeyboardButton("✏️ Изменить название", callback_data=f"edit_name:{code}"),
-        telebot.types.InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{code}")
-    )
-    markup.add(
-        telebot.types.InlineKeyboardButton("‹ Назад к списку", callback_data="profile_back")
-    )
-
-    bot.answer_callback_query(call.id)
-    try:
-        bot.edit_message_text(
-            with_footer(text),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup
-        )
-    except Exception as e:
-        safe_send_message(call.message.chat.id, with_footer(text), reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "profile_back")
-def handle_profile_back(call):
-    rows = get_links_by_owner(call.from_user.id)
-    bot.answer_callback_query(call.id)
-    if not rows:
-        try:
-            bot.edit_message_text(
-                with_footer("У вас больше нет сохранённых ссылок."),
-                call.message.chat.id,
-                call.message.message_id
-            )
-        except Exception:
-            pass
-        return
-    markup = build_profile_menu(rows)
-    try:
-        bot.edit_message_text(
-            with_footer(f"Ваши ссылки ({len(rows)}). Нажмите на любую для просмотра деталей:"),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup
-        )
-    except Exception:
-        pass
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("del:"))
-def handle_delete_link(call):
-    code = call.data.split(":", 1)[1]
-    success = delete_link(code, call.from_user.id)
-    if success:
-        bot.answer_callback_query(call.id, "Удалено ✅")
-        rows = get_links_by_owner(call.from_user.id)
-        if not rows:
-            try:
-                bot.edit_message_text(
-                    with_footer("Ссылка удалена. Сохранённых ссылок больше нет."),
-                    call.message.chat.id,
-                    call.message.message_id
-                )
-            except Exception:
-                pass
-        else:
-            markup = build_profile_menu(rows)
-            try:
-                bot.edit_message_text(
-                    with_footer(f"Ссылка удалена. Ваши ссылки ({len(rows)}):"),
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=markup
-                )
-            except Exception:
-                pass
-    else:
-        bot.answer_callback_query(call.id, "Не удалось удалить (ссылка не найдена или не ваша).", show_alert=True)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("edit_name:"))
-def handle_edit_name(call):
-    code = call.data.split(":", 1)[1]
-    row = get_link_full(code)
-    if not row or row[2] != call.from_user.id:
-        bot.answer_callback_query(call.id, "Ссылка не найдена или не ваша.", show_alert=True)
-        return
-    bot.answer_callback_query(call.id, "Введите новое название:")
-    msg = safe_send_message(call.message.chat.id, with_footer(f"Для {build_short_url(code)} введите новое название:"))
-    bot.register_next_step_handler(msg, process_edit_name, code, call.from_user.id)
-
-def process_edit_name(message, code, owner_id):
-    if message.from_user.id != owner_id:
-        return
-    name = (message.text or "").strip()
-    if not name:
-        safe_reply_to(message, with_footer("Название не может быть пустым."))
-        return
-    success = update_link_name(code, owner_id, name)
-    if success:
-        safe_reply_to(message, with_footer("Название обновлено!"))
-    else:
-        safe_reply_to(message, with_footer("Ошибка обновления."))
-
-# ==================== /shorten (без HWID) ====================
-
-user_data = {}
-user_data_lock = threading.Lock()
-
-@bot.message_handler(commands=['shorten'])
-def cmd_shorten(message):
-    if not is_subscribed(message.from_user.id):
-        send_subscribe_prompt(message.chat.id)
-        return
-
-    parts = message.text.strip().split(maxsplit=1)
-    if len(parts) > 1 and parts[1].strip():
-        url = parts[1].strip()
-        if not (url.startswith("http://") or url.startswith("https://")):
-            safe_reply_to(message, with_footer("Это не похоже на ссылку. Используйте /shorten <URL> или отправьте ссылку отдельно."))
-            return
-        with user_data_lock:
-            user_data[message.from_user.id] = {'url': url}
-        msg = safe_reply_to(message, with_footer("Введите название (будет отображаться в профиле):"))
-        bot.register_next_step_handler(msg, process_name)
-        return
-
-    msg = safe_reply_to(message, with_footer("Пришлите ссылку (http:// или https://), которую нужно сократить."))
-    bot.register_next_step_handler(msg, process_url)
-
-def process_url(message):
-    if not is_subscribed(message.from_user.id):
-        send_subscribe_prompt(message.chat.id)
-        return
-    url = (message.text or "").strip()
-    if not (url.startswith("http://") or url.startswith("https://")):
-        safe_reply_to(message, with_footer("Это не похоже на ссылку. Попробуйте ещё раз через /shorten."))
-        return
-    with user_data_lock:
-        user_data[message.from_user.id] = {'url': url}
-    msg = safe_reply_to(message, with_footer("Введите название (будет отображаться в профиле):"))
-    bot.register_next_step_handler(msg, process_name)
-
-def process_name(message):
-    user_id = message.from_user.id
-    with user_data_lock:
-        data = user_data.get(user_id)
-        if not data:
-            safe_reply_to(message, with_footer("Сессия истекла. Начните заново через /shorten."))
-            return
-        data['name'] = (message.text or "").strip() or "Без названия"
-    # Больше никаких вопросов о HWID — сразу сохраняем
-    url = data['url']
-    name = data['name']
-    code = save_link('url', url, user_id, name)
-    short_url = build_short_url(code)
-    response_text = f"✅ Ссылка сокращена!\n\n📌 Название: {name}\n🔗 {short_url}"
-    safe_reply_to(message, with_footer(response_text))
-
-# ==================== /addkeys ====================
+    welcome_text = (
+        "Здравствуйте.\n\n"
+        "• Отправьте ссылку **happ://crypt...**, чтобы расшифровать её в URL.\n"
+        "• Отправьте обычную ссылку (**http://...** или **https://...**), чтобы скачать подписку и достать из неё VPN-ключи.\n"
+        "• Команда /addkeys — чтобы сохранить свои ключи и получить короткую ссылку на них.\n"
+        "• Команда /shorten — чтобы сократить любую ссылку (оригинал будет скрыт).\n"
+        "• Команда /profile — посмотреть, изменить или удалить свои сохранённые ссылки."
+    )
+    safe_reply_to(message, with_footer(welcome_text), parse_mode="Markdown")
 
 @bot.message_handler(commands=['addkeys'])
 def cmd_addkeys(message):
-    if not is_subscribed(message.from_user.id):
-        send_subscribe_prompt(message.chat.id)
-        return
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
 
-    parts = message.text.strip().split(maxsplit=1)
-    if len(parts) > 1 and parts[1].strip():
-        message.text = parts[1].strip()
-        process_addkeys(message)
-        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        message.text = parts[1].strip()
+        process_addkeys(message)
+        return
 
-    msg = safe_reply_to(
-        message,
-        with_footer("Пришлите ключи, которые нужно сохранить (можно несколько, каждый с новой строки).")
-    )
-    bot.register_next_step_handler(msg, process_addkeys)
+    msg = bot.reply_to(
+        message,
+        with_footer(
+            "Пришлите ключи, которые нужно сохранить (можно несколько, каждый с новой строки "
+            "или через пробел), одним сообщением."
+        )
+    )
+    bot.register_next_step_handler(msg, process_addkeys)
 
 def process_addkeys(message):
-    try:
-        if not is_subscribed(message.from_user.id):
-            send_subscribe_prompt(message.chat.id)
-            return
+    try:
+        if not is_subscribed(message.from_user.id):
+            send_subscribe_prompt(message.chat.id)
+            return
 
-        text = (message.text or "").strip()
-        keys = extract_keys(text)
+        text = (message.text or "").strip()
+        keys = extract_keys(text)
 
-        if not keys:
-            safe_reply_to(message, with_footer("Не нашёл ни одного ключа. Попробуйте ещё раз через /addkeys."))
-            return
+        if not keys:
+            safe_reply_to(message, with_footer(
+                "Не нашёл ни одного ключа в сообщении (поддерживаются vless/vmess/trojan/ss/ssr/hysteria2/tuic). "
+                "Попробуйте ещё раз через /addkeys."
+            ))
+            return
 
-        content = "\n".join(keys)
-        code = save_link('keys', content, message.from_user.id, name=None)
-        short_url = build_short_url(code)
-        safe_reply_to(message, with_footer(f"✅ Ключи сохранены!\n\nСсылка:\n{short_url}"))
-    except Exception as e:
-        print(f"[ERROR] process_addkeys: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            safe_reply_to(message, with_footer(f"Ошибка: {e}"))
-        except Exception:
-            pass
+        content = "\n".join(keys)
+        code = save_link('keys', content, message.from_user.id)
+        short_url = build_short_url(code)
 
-# ==================== ОБРАБОТЧИК ТЕКСТА ====================
+        safe_reply_to(message, with_footer(
+            f"Сохранено ключей: {len(keys)}\n\nВаша короткая ссылка:\n{short_url}"
+        ))
+    except Exception as e:
+        print(f"[ОШИБКА в process_addkeys]: {e}")
+        try:
+            safe_reply_to(message, with_footer(f"Произошла ошибка при сохранении: {e}"))
+        except Exception:
+            pass
+
+@bot.message_handler(commands=['shorten'])
+def cmd_shorten(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
+
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        message.text = parts[1].strip()
+        process_shorten(message)
+        return
+
+    msg = bot.reply_to(
+        message,
+        with_footer("Пришлите ссылку (http:// или https://), которую нужно сократить.")
+    )
+    bot.register_next_step_handler(msg, process_shorten)
+
+def process_shorten(message):
+    try:
+        if not is_subscribed(message.from_user.id):
+            send_subscribe_prompt(message.chat.id)
+            return
+
+        text = (message.text or "").strip()
+
+        if not (text.startswith("http://") or text.startswith("https://")):
+            safe_reply_to(message, with_footer(
+                "Это не похоже на ссылку. Отправьте адрес, начинающийся с http:// или https://. "
+                "Попробуйте ещё раз через /shorten."
+            ))
+            return
+
+        code = save_link('url', text, message.from_user.id)
+        short_url = build_short_url(code)
+
+        safe_reply_to(message, with_footer(f"Готово! Короткая ссылка:\n{short_url}"))
+    except Exception as e:
+        print(f"[ОШИБКА в process_shorten]: {e}")
+        try:
+            safe_reply_to(message, with_footer(f"Произошла ошибка при сокращении: {e}"))
+        except Exception:
+            pass
+
+# ==================== ПРОФИЛЬ: компактное меню → детали по нажатию ====================
+
+def build_profile_menu(rows: list) -> telebot.types.InlineKeyboardMarkup:
+    """
+    Строит вертикальное меню: каждая кнопка — одна ссылка.
+    Формат: «🔗 /AbCd123» или «🔑 /AbCd123»
+    """
+    markup = telebot.types.InlineKeyboardMarkup()
+    for code, link_type, content, created_at in rows:
+        icon = "🔗" if link_type == 'url' else "🔑"
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                text=f"{icon}  /{code}",
+                callback_data=f"view:{code}"
+            )
+        )
+    return markup
+
+@bot.message_handler(commands=['profile'])
+def cmd_profile(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
+
+    rows = get_links_by_owner(message.from_user.id)
+
+    if not rows:
+        safe_reply_to(message, with_footer(
+            "У вас пока нет сохранённых ссылок. Создайте их через /shorten или /addkeys."
+        ))
+        return
+
+    markup = build_profile_menu(rows)
+    safe_reply_to(
+        message,
+        with_footer(f"Ваши ссылки ({len(rows)}). Нажмите на любую, чтобы посмотреть детали:"),
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("view:"))
+def handle_view_link(call):
+    code = call.data.split(":", 1)[1]
+    row = get_link_full(code)
+
+    if not row or row[2] != call.from_user.id:
+        bot.answer_callback_query(call.id, "Ссылка не найдена или не ваша.", show_alert=True)
+        return
+
+    link_type, content, _ = row
+    short_url = build_short_url(code)
+    type_label = "🔗 Ссылка" if link_type == 'url' else "🔑 Ключи"
+    preview = content if len(content) <= 200 else content[:197] + "..."
+
+    text = f"{type_label}\n{short_url}\n\n{preview}"
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(
+        telebot.types.InlineKeyboardButton("✏️ Изменить", callback_data=f"edit:{code}"),
+        telebot.types.InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{code}")
+    )
+    markup.add(
+        telebot.types.InlineKeyboardButton("‹ Назад к списку", callback_data="profile_back")
+    )
+
+    bot.answer_callback_query(call.id)
+    try:
+        bot.edit_message_text(
+            with_footer(text),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    except Exception:
+        safe_send_message(call.message.chat.id, with_footer(text), reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "profile_back")
+def handle_profile_back(call):
+    rows = get_links_by_owner(call.from_user.id)
+    bot.answer_callback_query(call.id)
+
+    if not rows:
+        try:
+            bot.edit_message_text(
+                with_footer("У вас больше нет сохранённых ссылок."),
+                call.message.chat.id,
+                call.message.message_id
+            )
+        except Exception:
+            pass
+        return
+
+    markup = build_profile_menu(rows)
+    try:
+        bot.edit_message_text(
+            with_footer(f"Ваши ссылки ({len(rows)}). Нажмите на любую, чтобы посмотреть детали:"),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    except Exception:
+        pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del:"))
+def handle_delete_link(call):
+    code = call.data.split(":", 1)[1]
+    success = delete_link(code, call.from_user.id)
+
+    if success:
+        bot.answer_callback_query(call.id, "Удалено ✅")
+        # После удаления возвращаемся к обновлённому списку
+        rows = get_links_by_owner(call.from_user.id)
+        if not rows:
+            try:
+                bot.edit_message_text(
+                    with_footer("Ссылка удалена. Сохранённых ссылок больше нет."),
+                    call.message.chat.id,
+                    call.message.message_id
+                )
+            except Exception:
+                pass
+        else:
+            markup = build_profile_menu(rows)
+            try:
+                bot.edit_message_text(
+                    with_footer(f"Ссылка удалена. Ваши ссылки ({len(rows)}):"),
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+            except Exception:
+                pass
+    else:
+        bot.answer_callback_query(call.id, "Не удалось удалить (ссылка не найдена или не ваша).", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("edit:"))
+def handle_edit_link(call):
+    code = call.data.split(":", 1)[1]
+    row = get_link_full(code)
+
+    if not row or row[2] != call.from_user.id:
+        bot.answer_callback_query(call.id, "Ссылка не найдена или не ваша.", show_alert=True)
+        return
+
+    link_type = row[0]
+    bot.answer_callback_query(call.id)
+
+    if link_type == 'url':
+        prompt = f"Пришлите новую ссылку (http:// или https://) вместо старой для {build_short_url(code)}:"
+    else:
+        prompt = f"Пришлите новые ключи (вместо старых) для {build_short_url(code)}:"
+
+    msg = safe_send_message(call.message.chat.id, with_footer(prompt))
+    bot.register_next_step_handler(msg, process_edit_link, code, link_type, call.from_user.id)
+
+def process_edit_link(message, code, link_type, owner_id):
+    try:
+        if message.from_user.id != owner_id:
+            return
+
+        new_text = (message.text or "").strip()
+
+        if link_type == 'url':
+            if not (new_text.startswith("http://") or new_text.startswith("https://")):
+                safe_reply_to(message, with_footer(
+                    "Это не похоже на ссылку. Изменения отменены, ссылка осталась прежней."
+                ))
+                return
+            new_content = new_text
+        else:
+            keys = extract_keys(new_text)
+            if not keys:
+                safe_reply_to(message, with_footer(
+                    "Не нашёл ни одного ключа в сообщении. Изменения отменены, ключи остались прежними."
+                ))
+                return
+            new_content = "\n".join(keys)
+
+        success = update_link_content(code, owner_id, new_content)
+
+        if success:
+            safe_reply_to(message, with_footer(
+                f"Обновлено! Короткая ссылка не изменилась:\n{build_short_url(code)}"
+            ))
+        else:
+            safe_reply_to(message, with_footer("Не удалось обновить — ссылка больше не существует."))
+    except Exception as e:
+        print(f"[ОШИБКА в process_edit_link]: {e}")
+        try:
+            safe_reply_to(message, with_footer(f"Произошла ошибка при обновлении: {e}"))
+        except Exception:
+            pass
+
+# ==================== ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА ====================
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
-    try:
-        if not is_subscribed(message.from_user.id):
-            send_subscribe_prompt(message.chat.id)
-            return
+    try:
+        handle_text_inner(message)
+    except Exception as e:
+        print(f"[ОШИБКА в handle_text]: {e}")
+        try:
+            safe_reply_to(message, with_footer(f"Произошла ошибка при обработке: {e}"))
+        except Exception:
+            pass
 
-        text = message.text.strip()
+def handle_text_inner(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
 
-        if text.startswith("happ://crypt"):
-            safe_reply_to(message, with_footer("Обрабатываю happ-ссылку..."))
-            decrypted_url = decrypt_happ_link(text)
-            if decrypted_url:
-                safe_reply_to(message, with_footer(f"Ссылка успешно расшифрована:\n\n{decrypted_url}"))
-            else:
-                safe_reply_to(message, with_footer("Не удалось расшифровать ссылку."))
+    text = message.text.strip()
 
-        elif text.startswith("http://") or text.startswith("https://"):
-            safe_reply_to(message, with_footer("Загружаю подписку как клиент Happ..."))
-            configs_text = fetch_and_decode_configs(text)
+    if text.startswith("happ://crypt"):
+        safe_reply_to(message, with_footer("Обрабатываю happ-ссылку..."))
+        decrypted_url = decrypt_happ_link(text)
+        if decrypted_url:
+            safe_reply_to(message, with_footer(f"Ссылка успешно расшифрована:\n\n{decrypted_url}"))
+        else:
+            safe_reply_to(message, with_footer("Не удалось расшифровать ссылку. Проверьте правильность введенных данных."))
 
-            # Если пришла ошибка или пусто
-            if configs_text.startswith("Сетевая ошибка") or configs_text.startswith("Внутренняя ошибка") or not configs_text:
-                safe_reply_to(message, with_footer(configs_text or "Пустой ответ от сервера."))
-                return
+    elif text.startswith("http://") or text.startswith("https://"):
+        safe_reply_to(message, with_footer("Загружаю подписку по ссылке и извлекаю конфигурации..."))
+        configs_text = fetch_and_decode_configs(text)
 
-            keys = extract_keys(configs_text)
+        if configs_text.startswith("Сетевая ошибка") or configs_text.startswith("Внутренняя ошибка"):
+            safe_reply_to(message, with_footer(configs_text))
+            return
 
-            if keys:
-                send_keys(message.chat.id, keys)
-            else:
-                # Если ключей нет, отправляем сырые данные для диагностики
-                file_name = next_file_name()
-                try:
-                    with open(file_name, 'w', encoding='utf-8') as file:
-                        file.write(configs_text)
-                    with open(file_name, 'rb') as file:
-                        safe_send_document(
-                            message.chat.id,
-                            file,
-                            visible_file_name=file_name,
-                            caption=with_footer("Ключи не найдены. Вот что вернул сервер (сырые данные).")
-                        )
-                except Exception as e:
-                    safe_reply_to(message, with_footer(f"Ошибка при создании файла: {e}"))
-                finally:
-                    if os.path.exists(file_name):
-                        os.remove(file_name)
+        keys = extract_keys(configs_text)
 
-        else:
-            safe_reply_to(message, with_footer("Неверный формат. Используйте /shorten, /addkeys или отправьте ссылку на подписку."))
-    except Exception as e:
-        print(f"[ERROR] handle_text: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            safe_reply_to(message, with_footer(f"Ошибка: {e}"))
-        except Exception:
-            pass
+        if keys:
+            send_keys(message.chat.id, keys)
+        else:
+            file_name = next_file_name()
+            try:
+                with open(file_name, 'w', encoding='utf-8') as file:
+                    file.write(configs_text)
+                with open(file_name, 'rb') as file:
+                    safe_send_document(
+                        message.chat.id,
+                        file,
+                        visible_file_name=file_name,
+                        caption=with_footer("VPN-ключи по известным схемам не найдены. Файл с сырым содержимым подписки во вложении.")
+                    )
+            except Exception as e:
+                safe_reply_to(message, with_footer(f"Ошибка при создании файла: {e}"))
+            finally:
+                if os.path.exists(file_name):
+                    os.remove(file_name)
+
+    else:
+        safe_reply_to(message, with_footer(
+            "Неверный формат. Отправьте либо ссылку **happ://crypt...**, либо обычную ссылку на подписку (**http://...**), "
+            "либо используйте /addkeys или /shorten."
+        ), parse_mode="Markdown")
 
 # ==================== ЗАПУСК ====================
 
 if __name__ == '__main__':
-    import traceback
-    try:
-        print("[START] Запуск бота...")
-        conn = get_db()
-        conn.close()
-        print("[START] База данных инициализирована")
-        http_thread = threading.Thread(target=run_http_server, daemon=True)
-        http_thread.start()
-        print("[START] HTTP сервер запущен")
-        bot.remove_webhook()
-        print("[START] Webhook удалён")
-        print("[START] Запуск polling...")
-        bot.polling(none_stop=True)
-    except Exception:
-        traceback.print_exc()
-    finally:
-        input("\nНажмите Enter, чтобы закрыть окно...")
+    import traceback
+    try:
+        http_thread = threading.Thread(target=run_http_server, daemon=True)
+        http_thread.start()
+
+        bot.remove_webhook()
+        bot.polling(none_stop=True)
+    except Exception:
+        traceback.print_exc()
+    finally:
+        input("\nНажмите Enter, чтобы закрыть окно...")
