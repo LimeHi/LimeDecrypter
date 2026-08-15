@@ -191,12 +191,24 @@ def with_footer(text: str) -> str:
         return f"{text}\n\n{FOOTER_TAG}"
     return text
 
+# КЭШИРОВАНИЕ ПРОВЕРКИ ПОДПИСКИ (чтобы бот отвечал моментально)
+sub_cache = {}
+
 def is_subscribed(user_id: int) -> bool:
+    now = time.time()
+    # Если проверка была успешной за последние 5 минут — отдаем из кэша
+    if user_id in sub_cache and now - sub_cache[user_id]['time'] < 300:
+        return sub_cache[user_id]['status']
+        
     try:
         member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status in ('member', 'administrator', 'creator')
+        status = member.status in ('member', 'administrator', 'creator')
+        sub_cache[user_id] = {'status': status, 'time': now}
+        return status
     except Exception as e:
         print(f"[ОШИБКА проверки подписки]: {e}")
+        # Запоминаем ошибку на 30 секунд, чтобы не спамить API и не вешать бота
+        sub_cache[user_id] = {'status': False, 'time': now - 270} 
         return False
 
 def send_subscribe_prompt(chat_id: int):
@@ -213,6 +225,10 @@ def send_subscribe_prompt(chat_id: int):
 
 @bot.callback_query_handler(func=lambda call: call.data == "check_sub")
 def handle_check_sub(call):
+    # Принудительно сбрасываем кэш при проверке по кнопке
+    if call.from_user.id in sub_cache:
+        del sub_cache[call.from_user.id]
+        
     if is_subscribed(call.from_user.id):
         bot.answer_callback_query(call.id, "Подписка подтверждена ✅")
         safe_send_message(call.message.chat.id, with_footer("Отлично! Теперь вы можете пользоваться ботом."))
@@ -235,8 +251,6 @@ def is_html(content_type: str, body: str) -> bool:
     return "text/html" in content_type or body.lstrip().startswith(("<html", "<!DOCTYPE", "<!doctype"))
 
 def extract_keys(text: str) -> list:
-    # Здесь можно добавить конвертер JSON, если нужен, 
-    # но регулярки достаточно для чистого Base64/URI.
     keys = KEY_PATTERN.findall(text)
     return keys
 
@@ -258,8 +272,8 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
         if headers is None: headers = HAPP_HEADERS.copy()
         session = requests.Session()
         session.headers.update(headers)
-        # Таймаут снижен до 5 секунд, чтобы клиент не зависал в бесконечном ожидании
-        resp = session.get(u, timeout=5, stream=True)
+        # Таймаут увеличен до 10 секунд (5 было мало для некоторых серверов)
+        resp = session.get(u, timeout=10, stream=True)
         resp.raise_for_status()
         
         if resp.headers.get('Content-Encoding') == 'gzip':
@@ -274,14 +288,13 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
 
     print(f"[HTTP] Пытаемся скачать конфиги по URL: {url} (HWID: {actual_hwid})")
 
-    # FAIL-FAST: Если первый же запрос падает по таймауту или недоступности сети — прерываем всё.
     try:
         resp, body = fetch_with_headers(url)
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
         print(f"[HTTP-ОШИБКА] Целевой сервер недоступен (тайм-аут или нет сети): {e}")
         return "СЕТЕВАЯ_ОШИБКА"
     except Exception as e:
-        print(f"[HTTP-ОШИБКА] Первый запрос не удался: {e}")
+        print(f"[HTTP-ОШИБКА] Запрос отклонен сервером: {e}")
         body = ""
 
     if 'resp' in locals():
@@ -299,7 +312,7 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
                 except Exception:
                     pass
 
-    # Альтернативные пути (выполняются только если сервер отвечает, но отдает не то)
+    # Альтернативные пути
     base = url.rstrip("/")
     candidates = [
         f"{base}/sub",
@@ -329,11 +342,11 @@ def health_check():
 
 @app.route('/<code>')
 def resolve_link(code):
-    print(f"\n[GET] Клиент запросил ссылку: /{code}")
+    print(f"\n[GET] Запрошена ссылка: /{code}")
     row = get_link_full(code)
     
     if not row:
-        print(f"[404] Код {code} НЕ НАЙДЕН в базе данных. (Возможно, база стерлась при перезапуске).")
+        print(f"[404] Код {code} НЕ НАЙДЕН в базе данных.")
         return Response("Error 404: Subscription not found. Please create a new link in the bot.", status=404, mimetype='text/plain')
 
     link_type, content, owner_id, name, hwid = row
@@ -351,7 +364,7 @@ def resolve_link(code):
             
             if configs_text == "СЕТЕВАЯ_ОШИБКА":
                 print(f"[502] Оригинальный сервер недоступен.")
-                return Response("Error 502: Original server is down or unreachable (Timeout).", status=502, mimetype='text/plain')
+                return Response("Error 502: Original server is down or blocked by your hosting provider.", status=502, mimetype='text/plain')
 
             keys = extract_keys(configs_text)
             
