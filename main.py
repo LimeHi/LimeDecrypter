@@ -39,8 +39,9 @@ DB_PATH = os.path.join(DATA_DIR, 'links.db')
 
 bot = telebot.TeleBot(TOKEN)
 
-telebot.apihelper.READ_TIMEOUT = 60
-telebot.apihelper.CONNECT_TIMEOUT = 60
+# Снижаем базовые таймауты Telegram API, чтобы бот не зависал при проблемах с сетью
+telebot.apihelper.READ_TIMEOUT = 20
+telebot.apihelper.CONNECT_TIMEOUT = 15
 
 # ==================== БЕЗОПАСНАЯ ОТПРАВКА ====================
 
@@ -426,7 +427,6 @@ def fetch_and_decode_configs(url: str, hwid: str = None) -> str:
             headers = HAPP_HEADERS.copy()
         session = requests.Session()
         session.headers.update(headers)
-        # Таймаут снижен до 5 секунд
         resp = session.get(u, timeout=5, stream=True)
         resp.raise_for_status()
         
@@ -532,10 +532,6 @@ def resolve_link(code):
         encoded_sub = base64.b64encode(content.encode('utf-8')).decode('utf-8')
         return Response(encoded_sub, mimetype='text/plain')
 
-def run_http_server():
-    # use_reloader=False предотвращает блокировку потока Flask'ом
-    app.run(host='0.0.0.0', port=PORT, threaded=True, use_reloader=False)
-
 # ==================== КОМАНДЫ БОТА ====================
 
 @bot.message_handler(commands=['start', 'help'])
@@ -545,7 +541,6 @@ def send_welcome(message):
         send_subscribe_prompt(message.chat.id)
         return
 
-    # Заменил символы ** на <b>, чтобы избежать ошибок парсинга Markdown в клиентах
     welcome_text = (
         "Здравствуйте.\n\n"
         "📌 <b>Бот умеет:</b>\n"
@@ -870,28 +865,36 @@ def handle_text(message):
 
 # ==================== ЗАПУСК ====================
 
+user_data_lock = threading.Lock()
+user_data = {}
+
+def run_bot_polling():
+    print("[START] Запуск polling Telegram бота...")
+    bot.infinity_polling(timeout=60, logger_level=None)
+
 if __name__ == '__main__':
     import traceback
     try:
-        print("[START] Запуск бота...")
+        print("[START] Инициализация...")
         conn = get_db()
         conn.close()
-        print("[START] База данных инициализирована")
+        print("[START] База данных готова")
         
-        http_thread = threading.Thread(target=run_http_server, daemon=True)
-        http_thread.start()
-        print("[START] HTTP сервер запущен")
-        
+        # Удаление вебхука с минимальным таймаутом, чтобы не зависало
         try:
-            bot.remove_webhook()
-            print("[START] Webhook удалён")
+            bot.delete_webhook(drop_pending_updates=True, timeout=5)
+            print("[START] Webhook очищен")
         except Exception as e:
-            print(f"[START] Внимание (удаление вебхука): {e}. Продолжаю запуск...")
-            
-        print("[START] Запуск polling...")
-        # Установил robust loop для polling'a, чтобы не падал
-        bot.infinity_polling(timeout=60, logger_level=None)
+            print(f"[START] Ошибка очистки вебхука (игнорируется): {e}")
+
+        # Запускаем бота в ФОНОВОМ потоке
+        bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
+        bot_thread.start()
+        
+        # Запускаем Flask сервер в ГЛАВНОМ потоке
+        print(f"[START] HTTP сервер запускается на порту {PORT}")
+        app.run(host='0.0.0.0', port=PORT, threaded=True, use_reloader=False)
+
     except Exception:
         traceback.print_exc()
-    finally:
         input("\nНажмите Enter, чтобы закрыть окно...")
